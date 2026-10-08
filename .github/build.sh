@@ -6,13 +6,23 @@ target="${1:?target is required}"
 output="${2:-dist}"
 ffmpeg_version=8.1.3
 ffmpeg_source=7138d28c96d9d3e3af4ee3d8cad72741f8ffb40da90c1112235dea3ecd3178a3
+ffmpeg_release=autobuild-2026-10-06-13-06
+ffmpeg_build=ffmpeg-n$ffmpeg_version-14-g330caae0c1
 x264_commit=b35605ace3ddf7c1a5d67a2eb553f034aef41d55
 moltenvk_version=v1.4.2
 moltenvk_package=f95765a6229cb7b915990a2890ce12ebe36a730b021545d3d52ae69ce4c4024e
 
 case "$target" in
-  x86_64-unknown-linux-gnu) prefix=lib suffix=.so ;;
-  x86_64-pc-windows-msvc) prefix='' suffix=.dll ;;
+  x86_64-unknown-linux-gnu)
+    prefix=lib suffix=.so
+    archive="$ffmpeg_build-linux64-gpl-shared-8.1.tar.xz"
+    hash=a6d0ea7dfef6ef85d86b8acf1c0a2d5288a05bac42c2cb16914e26830da3d344
+    ;;
+  x86_64-pc-windows-msvc)
+    prefix='' suffix=.dll
+    archive="$ffmpeg_build-win64-gpl-shared-8.1.zip"
+    hash=751c56e0b63426426487ab4048031b0166281c59c0a7e33ef7dd7428495e1d8a
+    ;;
   aarch64-apple-darwin | x86_64-apple-darwin)
     prefix=lib suffix=.dylib
     export MACOSX_DEPLOYMENT_TARGET=12.0
@@ -36,7 +46,10 @@ unpack() {
     echo "$1 does not have the pinned hash" >&2
     exit 1
   fi
-  tar -xf "$work/download" -C "$work"
+  case "$1" in
+    *.zip) unzip -q "$work/download" -d "$work" ;;
+    *) tar -xf "$work/download" -C "$work" ;;
+  esac
   rm "$work/download"
 }
 SOURCE_DATE_EPOCH="$(git -c safe.directory="$root" show -s --format=%ct HEAD)"
@@ -55,6 +68,11 @@ if [[ "$target" != *-apple-darwin ]]; then
   # macos has no tensorrt
   cp "$work/rife/${prefix}interpolini_rife_trt$suffix" "$output/bin/"
   cp "$work/rife/_deps/tensorrt-src/LICENSE" "$output/licenses/tensorrt-headers.txt"
+
+  # btbn deletes its daily builds, so the one that is pinned stays here
+  unpack "https://github.com/BtbN/FFmpeg-Builds/releases/download/$ffmpeg_release/$archive" "$hash"
+  folder="${archive%.zip}"
+  mv "$work/${folder%.tar.xz}" "$output/ffmpeg"
 else
   # apple killed vulkan so we bring our own
   unpack "https://github.com/KhronosGroup/MoltenVK/releases/download/$moltenvk_version/MoltenVK-macos.tar" "$moltenvk_package"
@@ -84,5 +102,5 @@ fi
 {
   echo "Commit: $(git -c safe.directory="$root" rev-parse HEAD)"
   echo "Target: $target"
-  [[ "$target" != *-apple-darwin ]] || echo "FFmpeg: $ffmpeg_version"
+  echo "FFmpeg: $ffmpeg_version"
 } > "$output/BUILD.txt"
