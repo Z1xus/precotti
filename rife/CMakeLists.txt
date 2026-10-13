@@ -54,6 +54,17 @@ string(REPLACE "if (opt.use_fp16_packed)" "if (false)" patched "${warp}")
 if(NOT warp STREQUAL patched)
     file(WRITE ${source}/warp.cpp "${patched}")
 endif()
+# the fork does not look at the result of the gpu work, so a lost gpu gave bad pictures and no error
+file(READ ${source}/rife.cpp rife)
+string(REPLACE "cmd.submit_and_wait();" "if (cmd.submit_and_wait() != 0)
+        {
+            vkdev->reclaim_blob_allocator(blob_vkallocator);
+            vkdev->reclaim_staging_allocator(staging_vkallocator);
+            return -1;
+        }" patched "${rife}")
+if(NOT rife STREQUAL patched)
+    file(WRITE ${source}/rife.cpp "${patched}")
+endif()
 if(NOT EXISTS ${source}/LICENSE)
     file(DOWNLOAD ${fork}/LICENSE ${source}/LICENSE)
 endif()

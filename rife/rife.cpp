@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <mutex>
 #include <string>
 
 #include "gpu.h"
@@ -46,6 +47,9 @@ EXPORT int rife_prepare(void*, int, int, void (*)(void*, float), void*)
 
 EXPORT int rife_process(void* rife, const uint8_t* first, const uint8_t* second, int width, int height, float time, uint8_t* output)
 {
+    // ncnn loses the gpu when two rife objects run at the same time
+    static std::mutex gpu;
+    const std::lock_guard<std::mutex> lock(gpu);
     const ncnn::Mat a(width, height, (void*)first, (size_t)3, 3);
     const ncnn::Mat b(width, height, (void*)second, (size_t)3, 3);
     ncnn::Mat out(width, height, (void*)output, (size_t)3, 3);
