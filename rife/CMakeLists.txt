@@ -62,6 +62,8 @@ string(REPLACE "cmd.submit_and_wait();" "if (cmd.submit_and_wait() != 0)
             vkdev->reclaim_staging_allocator(staging_vkallocator);
             return -1;
         }" patched "${rife}")
+# amd and intel gpus do fp16 math at up to twice the rate of fp32
+string(REPLACE "opt.use_fp16_arithmetic = false;" "opt.use_fp16_arithmetic = true;" patched "${patched}")
 if(NOT rife STREQUAL patched)
     file(WRITE ${source}/rife.cpp "${patched}")
 endif()
