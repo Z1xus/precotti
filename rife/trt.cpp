@@ -39,6 +39,7 @@ struct Rife {
 
     bool prepare(int w, int h)
     {
+        failure.clear();
         width = w;
         height = h;
         wide = (w + 63) / 64 * 64;
@@ -56,13 +57,17 @@ struct Rife {
         const char* in = engine->getIOTensorName(0);
         const char* out = engine->getIOTensorName(1);
         channels = engine->getTensorShape(in).d[1];
-        if (cuda_malloc((void**)&input, channels * pixels * sizeof(float)) || cuda_malloc((void**)&output, 3 * pixels * sizeof(float)))
+        if (cuda_malloc((void**)&input, channels * pixels * sizeof(float)) || cuda_malloc((void**)&output, 3 * pixels * sizeof(float))) {
+            failure = "not enough gpu memory";
             return false;
+        }
         if (!context->setInputShape(in, Dims4(1, channels, high, wide)) || !context->setTensorAddress(in, input) || !context->setTensorAddress(out, output))
             return false;
 
-        if (cuda_malloc_host((void**)&planes, 4 * pixels * sizeof(float)))
+        if (cuda_malloc_host((void**)&planes, 4 * pixels * sizeof(float))) {
+            failure = "not enough memory";
             return false;
+        }
         for (int y = 0; y < high; y++) {
             for (int x = 0; x < wide; x++) {
                 const size_t at = (size_t)y * wide + x;
@@ -174,4 +179,9 @@ EXPORT int rife_process(void* rife, const uint8_t* first, const uint8_t* second,
 EXPORT void rife_destroy(void* rife)
 {
     delete (Rife*)rife;
+}
+
+EXPORT const char* rife_error()
+{
+    return failure.c_str();
 }

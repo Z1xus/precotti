@@ -27,11 +27,16 @@ using namespace nvinfer1;
 
 namespace {
 
+// the last error on this thread, for the app to show
+thread_local std::string failure;
+
 struct Logger : ILogger {
     void log(Severity severity, const char* message) noexcept override
     {
-        if (severity <= Severity::kERROR)
+        if (severity <= Severity::kERROR) {
             fprintf(stderr, "tensorrt: %s\n", message);
+            failure = message;
+        }
     }
 } logger;
 

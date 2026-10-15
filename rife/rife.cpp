@@ -60,3 +60,9 @@ EXPORT void rife_destroy(void* rife)
 {
     delete (RIFE*)rife;
 }
+
+// ncnn tells nothing more than the result of a call
+EXPORT const char* rife_error()
+{
+    return "";
+}
