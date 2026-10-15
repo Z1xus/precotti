@@ -114,6 +114,10 @@ bool load_libraries()
     void* onnx = open(folder / ONNX);
     if (!cuda || !infer || !onnx)
         return false;
+#if _WIN32
+    // tensorrt loads its builder resource by name only when it makes an engine
+    SetDllDirectoryW(folder.c_str());
+#endif
     create_builder = (decltype(create_builder))symbol(infer, "createInferBuilder_INTERNAL");
     create_runtime = (decltype(create_runtime))symbol(infer, "createInferRuntime_INTERNAL");
     create_parser = (decltype(create_parser))symbol(onnx, "createNvOnnxParser_INTERNAL");
