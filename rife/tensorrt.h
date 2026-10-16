@@ -7,6 +7,7 @@
 #include <fstream>
 #include <functional>
 #include <iterator>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -230,6 +231,9 @@ std::vector<char> build(const std::filesystem::path& onnx, const std::filesystem
 ICudaEngine* load_engine(IRuntime* runtime, const std::filesystem::path& onnx, const std::filesystem::path& name, const Edit& edit,
     const std::function<bool(ICudaEngine&)>& fits, Monitor& monitor)
 {
+    // two builds at once need twice the gpu memory, and one that waits can load the engine of the other
+    static std::mutex building;
+    const std::lock_guard<std::mutex> guard(building);
     std::vector<char> plan = read(name);
     ICudaEngine* engine = plan.empty() ? nullptr : runtime->deserializeCudaEngine(plan.data(), plan.size());
     if (engine && !fits(*engine)) {
