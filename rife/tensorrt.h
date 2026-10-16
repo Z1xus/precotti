@@ -2,13 +2,12 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <string>
-#include <thread>
 #include <vector>
 
 #if _WIN32
@@ -33,10 +32,8 @@ thread_local std::string failure;
 struct Logger : ILogger {
     void log(Severity severity, const char* message) noexcept override
     {
-        if (severity <= Severity::kERROR) {
-            fprintf(stderr, "tensorrt: %s\n", message);
+        if (severity <= Severity::kERROR)
             failure = message;
-        }
     }
 } logger;
 
@@ -48,9 +45,16 @@ int (*cuda_malloc)(void**, size_t);
 int (*cuda_free)(void*);
 int (*cuda_malloc_host)(void**, size_t);
 int (*cuda_free_host)(void*);
-int (*cuda_memcpy)(void*, const void*, size_t, int);
+int (*cuda_memcpy)(void*, const void*, size_t, int, cudaStream_t);
+int (*cuda_stream_create)(cudaStream_t*, unsigned);
+int (*cuda_stream_destroy)(cudaStream_t);
+int (*cuda_event_create)(cudaEvent_t*, unsigned);
+int (*cuda_event_record)(cudaEvent_t, cudaStream_t);
+int (*cuda_event_wait)(cudaEvent_t);
+int (*cuda_event_destroy)(cudaEvent_t);
 
-const int TO_DEVICE = 1, TO_HOST = 2, ON_DEVICE = 3;
+const int TO_DEVICE = 1, TO_HOST = 2;
+const unsigned NON_BLOCKING = 1, BLOCKING_SYNC = 1, DISABLE_TIMING = 2;
 
 #if _WIN32
 const wchar_t* const CUDA = L"cudart64_12.dll";
@@ -125,47 +129,52 @@ bool load_libraries()
     cuda_free = (decltype(cuda_free))symbol(cuda, "cudaFree");
     cuda_malloc_host = (decltype(cuda_malloc_host))symbol(cuda, "cudaMallocHost");
     cuda_free_host = (decltype(cuda_free_host))symbol(cuda, "cudaFreeHost");
-    cuda_memcpy = (decltype(cuda_memcpy))symbol(cuda, "cudaMemcpy");
-    if (create_builder && create_runtime && create_parser && cuda_malloc && cuda_free && cuda_malloc_host && cuda_free_host && cuda_memcpy)
+    cuda_memcpy = (decltype(cuda_memcpy))symbol(cuda, "cudaMemcpyAsync");
+    cuda_stream_create = (decltype(cuda_stream_create))symbol(cuda, "cudaStreamCreateWithFlags");
+    cuda_stream_destroy = (decltype(cuda_stream_destroy))symbol(cuda, "cudaStreamDestroy");
+    cuda_event_create = (decltype(cuda_event_create))symbol(cuda, "cudaEventCreateWithFlags");
+    cuda_event_record = (decltype(cuda_event_record))symbol(cuda, "cudaEventRecord");
+    cuda_event_wait = (decltype(cuda_event_wait))symbol(cuda, "cudaEventSynchronize");
+    cuda_event_destroy = (decltype(cuda_event_destroy))symbol(cuda, "cudaEventDestroy");
+    if (create_builder && create_runtime && create_parser && cuda_malloc && cuda_free && cuda_malloc_host && cuda_free_host && cuda_memcpy
+        && cuda_stream_create && cuda_stream_destroy && cuda_event_create && cuda_event_record && cuda_event_wait && cuda_event_destroy)
         state = 1;
     return state > 0;
 }
 
-template <typename Rows>
-void bands(int rows, Rows work)
-{
-    const int count = std::clamp((int)std::thread::hardware_concurrency(), 1, 8);
-    std::vector<std::thread> threads;
-    for (int band = 0; band < count; band++)
-        threads.emplace_back(work, rows * band / count, rows * (band + 1) / count);
-    for (std::thread& thread : threads)
-        thread.join();
-}
-
-// tells how far the build of an engine is, from the steps of its first phase
+// these two phases take almost all of the build
 struct Monitor : IProgressMonitor {
     void (*report)(void*, float) = nullptr;
     void* user = nullptr;
-    std::string phase;
     int steps = 0;
+    float done = 0;
 
-    void phaseStart(const char* name, const char* parent, int32_t count) noexcept override
+    static bool timing(const char* name)
     {
-        if (!parent && phase.empty()) {
-            phase = name;
+        return !strcmp(name, "Timing graph nodes") || !strcmp(name, "Timing tensor reformats");
+    }
+
+    void phaseStart(const char* name, const char*, int32_t count) noexcept override
+    {
+        if (timing(name))
             steps = count;
-        }
     }
 
     bool stepComplete(const char* name, int32_t step) noexcept override
     {
-        if (report && phase == name && steps > 0)
-            report(user, (float)(step + 1) / steps);
+        if (report && timing(name) && steps > 0)
+            report(user, std::min(done + 0.5f * (step + 1) / steps, 1.f));
         return true;
     }
 
-    void phaseFinish(const char*) noexcept override { }
+    void phaseFinish(const char* name) noexcept override
+    {
+        if (timing(name))
+            done += 0.5f;
+    }
 };
+
+using Edit = std::function<bool(INetworkDefinition&, IOptimizationProfile&)>;
 
 std::vector<char> read(const std::filesystem::path& file)
 {
@@ -173,7 +182,7 @@ std::vector<char> read(const std::filesystem::path& file)
     return { std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>() };
 }
 
-std::vector<char> build(const std::filesystem::path& onnx, const std::filesystem::path& name, int high, int wide, Monitor& monitor)
+std::vector<char> build(const std::filesystem::path& onnx, const std::filesystem::path& name, const Edit& edit, Monitor& monitor)
 {
     std::vector<char> plan;
     IBuilder* builder = (IBuilder*)create_builder(&logger, NV_TENSORRT_VERSION);
@@ -184,10 +193,8 @@ std::vector<char> build(const std::filesystem::path& onnx, const std::filesystem
     IBuilderConfig* config = builder->createBuilderConfig();
     // the parser gets the bytes, it cannot open a path with letters outside of ascii on windows
     const std::vector<char> model = read(onnx);
-    if (parser && parser->parse(model.data(), model.size())) {
-        IOptimizationProfile* profile = builder->createOptimizationProfile();
-        for (OptProfileSelector kind : { OptProfileSelector::kMIN, OptProfileSelector::kOPT, OptProfileSelector::kMAX })
-            profile->setDimensions(network->getInput(0)->getName(), kind, Dims4(1, network->getInput(0)->getDimensions().d[1], high, wide));
+    IOptimizationProfile* profile = builder->createOptimizationProfile();
+    if (parser && parser->parse(model.data(), model.size()) && edit(*network, *profile)) {
         config->addOptimizationProfile(profile);
         config->setFlag(BuilderFlag::kFP16);
         config->setProgressMonitor(&monitor);
@@ -219,13 +226,18 @@ std::vector<char> build(const std::filesystem::path& onnx, const std::filesystem
     return plan;
 }
 
-// the engine for a model and a size, from its file or built and kept in it
-ICudaEngine* load_engine(IRuntime* runtime, const std::filesystem::path& onnx, const std::filesystem::path& name, int high, int wide, Monitor& monitor)
+// the engine from its file, or built and kept in it
+ICudaEngine* load_engine(IRuntime* runtime, const std::filesystem::path& onnx, const std::filesystem::path& name, const Edit& edit,
+    const std::function<bool(ICudaEngine&)>& fits, Monitor& monitor)
 {
     std::vector<char> plan = read(name);
     ICudaEngine* engine = plan.empty() ? nullptr : runtime->deserializeCudaEngine(plan.data(), plan.size());
+    if (engine && !fits(*engine)) {
+        delete engine;
+        engine = nullptr;
+    }
     if (!engine) {
-        plan = build(onnx, name, high, wide, monitor);
+        plan = build(onnx, name, edit, monitor);
         if (!plan.empty())
             engine = runtime->deserializeCudaEngine(plan.data(), plan.size());
     }
