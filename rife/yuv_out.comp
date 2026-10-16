@@ -1,0 +1,88 @@
+// rgb planes to yuv 4:2:0 bytes, four bytes per invocation
+
+#version 450
+
+#if NCNN_fp16_storage
+#extension GL_EXT_shader_16bit_storage: require
+#endif
+
+layout (binding = 0) readonly buffer bottom_blob { sfp bottom_blob_data[]; };
+layout (binding = 1) writeonly buffer top_blob { uint top_blob_data[]; };
+
+layout (push_constant) uniform parameter
+{
+    int w;
+    int h;
+    int cstep;
+    int padw;
+    int chroma;
+    int u;
+    int v;
+
+    float luma;
+    float luma_range;
+    float chroma_range;
+    float k_r;
+    float k_g;
+    float k_b;
+    float u_b;
+    float v_r;
+} p;
+
+vec3 rgb(int x, int y)
+{
+    const int at = y * p.padw + x;
+    return clamp(vec3(float(bottom_blob_data[at]), float(bottom_blob_data[p.cstep + at]), float(bottom_blob_data[2 * p.cstep + at])), 0.0, 1.0);
+}
+
+uint pack(vec4 values)
+{
+    const uvec4 bytes = uvec4(clamp(values + 0.5, 0.0, 255.0));
+    return bytes.x | (bytes.y << 8) | (bytes.z << 16) | (bytes.w << 24);
+}
+
+void main()
+{
+    const int gx = int(gl_GlobalInvocationID.x);
+    const vec3 k = vec3(p.k_r, p.k_g, p.k_b);
+
+    if (p.chroma == 0)
+    {
+        if (gx * 4 >= p.w * p.h)
+            return;
+        vec4 values;
+        for (int i = 0; i < 4; i++)
+        {
+            const int index = min(gx * 4 + i, p.w * p.h - 1);
+            values[i] = dot(k, rgb(index % p.w, index / p.w)) * p.luma_range + p.luma;
+        }
+        top_blob_data[gx] = pack(values);
+        return;
+    }
+
+    const int cw = p.w / 2;
+    if (gx * 4 >= cw * (p.h / 2))
+        return;
+    vec4 us;
+    vec4 vs;
+    for (int i = 0; i < 4; i++)
+    {
+        const int index = min(gx * 4 + i, cw * (p.h / 2) - 1);
+        const int x = index % cw * 2;
+        const int y = index / cw * 2;
+        vec2 sum = vec2(0.0);
+        for (int dy = 0; dy < 2; dy++)
+        {
+            for (int dx = 0; dx < 2; dx++)
+            {
+                const vec3 c = rgb(x + dx, y + dy);
+                const float luma = dot(k, c);
+                sum += vec2((c.b - luma) * p.u_b, (c.r - luma) * p.v_r);
+            }
+        }
+        us[i] = sum.x * 0.25 * p.chroma_range + 128.0;
+        vs[i] = sum.y * 0.25 * p.chroma_range + 128.0;
+    }
+    top_blob_data[p.u / 4 + gx] = pack(us);
+    top_blob_data[p.v / 4 + gx] = pack(vs);
+}

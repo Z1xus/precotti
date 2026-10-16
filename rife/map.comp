@@ -1,0 +1,152 @@
+// out = act(op(ka * a, kb * b)) on channel ranges of ncnn tensors, four values for each thread
+
+#version 450
+
+#if NCNN_fp16_storage
+#extension GL_EXT_shader_16bit_storage: require
+#endif
+
+// whole packs of four, one value goes through its component
+layout (binding = 0) readonly buffer a_blob { sfpvec4 a_data4[]; };
+layout (binding = 1) readonly buffer b_blob { sfpvec4 b_data4[]; };
+layout (binding = 2) writeonly buffer out_blob { sfpvec4 out_data4[]; };
+
+layout (push_constant) uniform parameter
+{
+    int size;
+    int channels;
+    int a_pack;
+    int a_step;
+    int a_from;
+    int b_pack;
+    int b_step;
+    int b_from;
+    int b_channels;
+    int b_size;
+    int out_pack;
+    int out_step;
+    int out_from;
+    int op;
+    int act;
+    // 4 when a thread writes the four channels of a pixel, 1 when it writes four pixels of a channel
+    int lanes;
+    int row;
+    float ka;
+    float kb;
+    float slope;
+} p;
+
+// a pack holds 1 or 4 channels, so shifts do the division
+float get_a(int i)
+{
+    return float(a_data4[i >> 2][i & 3]);
+}
+
+float get_b(int i)
+{
+    return float(b_data4[i >> 2][i & 3]);
+}
+
+void put(int i, float v)
+{
+    out_data4[i >> 2][i & 3] = sfp(v);
+}
+
+int at(int pack, int step, int c, int i)
+{
+    return pack == 4 ? ((c >> 2) * step + i) * 4 + (c & 3) : c * step + i;
+}
+
+// the four values of a thread from a, whole when a holds them the same way as the output
+vec4 load_a(int c, int i)
+{
+    const int ch = p.a_from + c;
+    if (p.lanes == 4 && p.a_pack == 4 && ch % 4 == 0)
+        return vec4(a_data4[(ch / 4) * p.a_step + i]);
+    if (p.lanes == 1 && p.a_pack == 1)
+        return vec4(a_data4[(ch * p.a_step + i) / 4]);
+    vec4 v;
+    for (int k = 0; k < 4; k++)
+        v[k] = get_a(p.lanes == 4 ? at(p.a_pack, p.a_step, ch + k, i) : at(p.a_pack, p.a_step, ch, i + k));
+    return v;
+}
+
+vec4 load_b(int c, int i)
+{
+    const bool one = p.b_channels == 1;
+    const int ch = p.b_from + (one ? 0 : c);
+    if (p.b_size == 1) {
+        if (p.lanes == 1 || one)
+            return vec4(get_b(at(p.b_pack, p.b_step, ch, 0)));
+        vec4 v;
+        for (int k = 0; k < 4; k++)
+            v[k] = get_b(at(p.b_pack, p.b_step, ch + k, 0));
+        return v;
+    }
+    if (p.lanes == 4 && one)
+        return vec4(get_b(at(p.b_pack, p.b_step, ch, i)));
+    if (p.lanes == 4 && p.b_pack == 4 && ch % 4 == 0)
+        return vec4(b_data4[(ch / 4) * p.b_step + i]);
+    if (p.lanes == 1 && p.b_pack == 1)
+        return vec4(b_data4[(ch * p.b_step + i) / 4]);
+    vec4 v;
+    for (int k = 0; k < 4; k++)
+        v[k] = get_b(p.lanes == 4 ? at(p.b_pack, p.b_step, ch + k, i) : at(p.b_pack, p.b_step, ch, i + k));
+    return v;
+}
+
+vec4 calc(vec4 a, vec4 b)
+{
+    vec4 v = a;
+    if (p.op == 0) v = a + b;
+    else if (p.op == 1) v = a - b;
+    else if (p.op == 2) v = a * b;
+    else if (p.op == 3) v = a / b;
+    else if (p.op == 4) v = max(a, b);
+    else if (p.op == 5) v = min(a, b);
+    else if (p.op == 7) v = b - a;
+    else if (p.op == 8) v = b / a;
+    else if (p.op == 100) v = b;
+
+    if (p.act == 1) v = mix(v * p.slope, v, step(0.0, v));
+    else if (p.act == 2) v = 1.0 / (1.0 + exp(-v));
+    return v;
+}
+
+void main()
+{
+    const int t = int(gl_GlobalInvocationID.y) * p.row + int(gl_GlobalInvocationID.x);
+
+    // a few channels in a packed output at any offset: a thread for each pixel, so the pack of a pixel is written in one place
+    if (p.lanes == 0)
+    {
+        if (t >= p.size)
+            return;
+        for (int c = 0; c < p.channels; c++)
+        {
+            const float a = p.ka * get_a(at(p.a_pack, p.a_step, p.a_from + c, t));
+            float b = p.kb;
+            if (p.b_pack > 0)
+                b *= get_b(at(p.b_pack, p.b_step, p.b_from + (p.b_channels == 1 ? 0 : c), p.b_size == 1 ? 0 : t));
+            put(at(p.out_pack, p.out_step, p.out_from + c, t), calc(vec4(a), vec4(b)).x);
+        }
+        return;
+    }
+    const int pixels = p.lanes == 4 ? p.size : (p.size + 3) / 4;
+    const int i = (t % pixels) * (p.lanes == 4 ? 1 : 4);
+    const int c = (t / pixels) * (p.lanes == 4 ? 4 : 1);
+
+    if (c >= p.channels)
+        return;
+
+    const vec4 a = p.ka * load_a(c, i);
+    const vec4 b = p.b_pack > 0 ? p.kb * load_b(c, i) : vec4(p.kb);
+
+    const vec4 v = calc(a, b);
+
+    const int ch = p.out_from + c;
+    if (p.lanes == 4)
+        out_data4[(ch / 4) * p.out_step + i] = sfpvec4(v);
+    else
+        out_data4[(ch * p.out_step + i) / 4] = sfpvec4(v);
+}

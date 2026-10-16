@@ -1,0 +1,72 @@
+// yuv 4:2:0 bytes to padded rgb planes
+
+#version 450
+
+#if NCNN_fp16_storage
+#extension GL_EXT_shader_16bit_storage: require
+#endif
+
+layout (binding = 0) readonly buffer bottom_blob { uint bottom_blob_data[]; };
+layout (binding = 1) writeonly buffer top_blob { sfp top_blob_data[]; };
+
+layout (push_constant) uniform parameter
+{
+    int w;
+    int h;
+    int u;
+    int v;
+
+    int outw;
+    int outh;
+    int outcstep;
+
+    float luma;
+    float luma_scale;
+    float chroma_scale;
+    float r_v;
+    float g_u;
+    float g_v;
+    float b_u;
+} p;
+
+float byte_at(int index)
+{
+    return float((bottom_blob_data[index >> 2] >> ((index & 3) * 8)) & 255u);
+}
+
+float chroma(int plane, int x, int y)
+{
+    const int cw = p.w / 2;
+    const int ch = p.h / 2;
+    const float cx = clamp((float(x) + 0.5) * 0.5 - 0.5, 0.0, float(cw - 1));
+    const float cy = clamp((float(y) + 0.5) * 0.5 - 0.5, 0.0, float(ch - 1));
+    const int x0 = int(cx);
+    const int y0 = int(cy);
+    const int x1 = min(x0 + 1, cw - 1);
+    const int y1 = min(y0 + 1, ch - 1);
+    const float fx = cx - float(x0);
+    const float fy = cy - float(y0);
+    const float top = mix(byte_at(plane + y0 * cw + x0), byte_at(plane + y0 * cw + x1), fx);
+    const float bottom = mix(byte_at(plane + y1 * cw + x0), byte_at(plane + y1 * cw + x1), fx);
+    return (mix(top, bottom, fy) - 128.0) * p.chroma_scale;
+}
+
+void main()
+{
+    const int gx = int(gl_GlobalInvocationID.x);
+    const int gy = int(gl_GlobalInvocationID.y);
+
+    if (gx >= p.outw || gy >= p.outh)
+        return;
+
+    const int x = min(gx, p.w - 1);
+    const int y = min(gy, p.h - 1);
+    const float luma = (byte_at(y * p.w + x) - p.luma) * p.luma_scale;
+    const float u = chroma(p.u, x, y);
+    const float v = chroma(p.v, x, y);
+
+    const int at = gy * p.outw + gx;
+    top_blob_data[at] = sfp(clamp(luma + p.r_v * v, 0.0, 1.0));
+    top_blob_data[p.outcstep + at] = sfp(clamp(luma - p.g_u * u - p.g_v * v, 0.0, 1.0));
+    top_blob_data[2 * p.outcstep + at] = sfp(clamp(luma + p.b_u * u, 0.0, 1.0));
+}

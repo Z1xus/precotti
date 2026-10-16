@@ -31,42 +31,9 @@ FetchContent_Declare(ncnn
     GIT_SUBMODULES glslang)
 FetchContent_MakeAvailable(ncnn)
 
-# this fork runs the newer models, its repository holds all models, so only the needed files come
+# the models come from this fork of rife-ncnn-vulkan
 set(fork https://raw.githubusercontent.com/TNTwise/rife-ncnn-vulkan/13338e38debe2e400b3eeecf6792312d01a692f9)
 set(source ${CMAKE_CURRENT_BINARY_DIR}/source)
-set(shaders rife_flow_tta_avg rife_flow_tta_temporal_avg rife_out_tta_temporal_avg rife_postproc
-    rife_postproc_tta rife_preproc rife_preproc_tta rife_v2_flow_tta_avg rife_v2_flow_tta_temporal_avg
-    rife_v4_flow_tta_avg rife_v4_flow_tta_temporal_avg rife_v4_timestep rife_v4_timestep_tta
-    warp warp_pack4 warp_pack8)
-list(TRANSFORM shaders APPEND .comp)
-foreach(file rife.cpp rife.h rife_ops.h warp.cpp generate_shader_comp_header.cmake ${shaders})
-    if(NOT EXISTS ${source}/${file})
-        file(DOWNLOAD ${fork}/src/${file} ${source}/${file} STATUS status)
-        if(NOT status MATCHES "^0;")
-            file(REMOVE ${source}/${file})
-            message(FATAL_ERROR "${file}: ${status}")
-        endif()
-    endif()
-endforeach()
-# this ncnn has no shader for 8 values in a pixel and never asks for one, so the fork must not build it
-file(READ ${source}/warp.cpp warp)
-string(REPLACE "if (opt.use_fp16_packed)" "if (false)" patched "${warp}")
-if(NOT warp STREQUAL patched)
-    file(WRITE ${source}/warp.cpp "${patched}")
-endif()
-# the fork does not look at the result of the gpu work, so a lost gpu gave bad pictures and no error
-file(READ ${source}/rife.cpp rife)
-string(REPLACE "cmd.submit_and_wait();" "if (cmd.submit_and_wait() != 0)
-        {
-            vkdev->reclaim_blob_allocator(blob_vkallocator);
-            vkdev->reclaim_staging_allocator(staging_vkallocator);
-            return -1;
-        }" patched "${rife}")
-# amd and intel gpus do fp16 math at up to twice the rate of fp32
-string(REPLACE "opt.use_fp16_arithmetic = false;" "opt.use_fp16_arithmetic = true;" patched "${patched}")
-if(NOT rife STREQUAL patched)
-    file(WRITE ${source}/rife.cpp "${patched}")
-endif()
 if(NOT EXISTS ${source}/LICENSE)
     file(DOWNLOAD ${fork}/LICENSE ${source}/LICENSE)
 endif()
@@ -76,21 +43,18 @@ foreach(file flownet.param flownet.bin)
     endif()
 endforeach()
 
-list(TRANSFORM shaders PREPEND ${source}/)
-foreach(shader ${shaders})
-    get_filename_component(name ${shader} NAME_WE)
+foreach(name yuv_in yuv_out map interp warp shuffle)
     set(header ${CMAKE_CURRENT_BINARY_DIR}/${name}.comp.hex.h)
     add_custom_command(
         OUTPUT ${header}
-        COMMAND ${CMAKE_COMMAND} -DSHADER_SRC=${shader} -DSHADER_COMP_HEADER=${header}
-                -P ${source}/generate_shader_comp_header.cmake
-        DEPENDS ${shader}
+        COMMAND ${CMAKE_COMMAND} -Dinput=${CMAKE_CURRENT_SOURCE_DIR}/${name}.comp -Doutput=${header} -P ${CMAKE_CURRENT_SOURCE_DIR}/shader.cmake
+        DEPENDS ${name}.comp shader.cmake
         VERBATIM)
     list(APPEND headers ${header})
 endforeach()
 
-add_library(interpolini_rife SHARED rife.cpp ${source}/rife.cpp ${source}/warp.cpp ${headers})
-target_include_directories(interpolini_rife PRIVATE ${source} ${CMAKE_CURRENT_BINARY_DIR})
+add_library(interpolini_rife SHARED rife.cpp graph.cpp ${headers})
+target_include_directories(interpolini_rife PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${ncnn_SOURCE_DIR}/src/layer)
 target_link_libraries(interpolini_rife PRIVATE ncnn)
 
 # rife on tensorrt: only the headers are needed to build it, the app downloads the libraries

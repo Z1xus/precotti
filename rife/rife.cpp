@@ -1,9 +1,20 @@
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <condition_variable>
+#include <cstdlib>
 #include <mutex>
+#include <set>
 #include <string>
+#include <vector>
 
+#include "command.h"
 #include "gpu.h"
-#include "rife.h"
+#include "graph.h"
+#include "net.h"
+
+#include "yuv_in.comp.hex.h"
+#include "yuv_out.comp.hex.h"
 
 #if _WIN32
 #include <windows.h>
@@ -12,53 +23,281 @@
 #define EXPORT extern "C" __attribute__((visibility("default")))
 #endif
 
+namespace {
+
+// the graph runs the warps, ncnn only needs to know the layer
+struct Warp : ncnn::Layer {
+    Warp()
+    {
+        one_blob_only = false;
+        support_vulkan = true;
+    }
+};
+
+ncnn::Layer* make_warp(void*)
+{
+    return new Warp;
+}
+
+struct Picture {
+    uint8_t* data[3];
+    ptrdiff_t stride[3];
+    int id;
+};
+
+FILE* open(const char* path)
+{
+#if _WIN32
+    std::wstring wide(MultiByteToWideChar(CP_UTF8, 0, path, -1, nullptr, 0), 0);
+    MultiByteToWideChar(CP_UTF8, 0, path, -1, wide.data(), (int)wide.size());
+    return _wfopen(wide.c_str(), L"rb");
+#else
+    return fopen(path, "rb");
+#endif
+}
+
+// two frames in work keep the gpu busy, more only take its memory
+struct Turn {
+    std::mutex& lock;
+    std::condition_variable& room;
+    int& working;
+
+    Turn(std::mutex& lock, std::condition_variable& room, int& working)
+        : lock(lock)
+        , room(room)
+        , working(working)
+    {
+        std::unique_lock<std::mutex> hold(lock);
+        room.wait(hold, [&] { return working < 2; });
+        working++;
+    }
+
+    ~Turn()
+    {
+        {
+            const std::lock_guard<std::mutex> hold(lock);
+            working--;
+        }
+        room.notify_one();
+    }
+};
+
+struct Rife {
+    ncnn::VulkanDevice* gpu = nullptr;
+    ncnn::Net flownet;
+    Graph graph;
+    std::mutex busy;
+    std::condition_variable room;
+    int working = 0;
+    ncnn::Pipeline* in = nullptr;
+    ncnn::Pipeline* out = nullptr;
+    int padding = 32;
+    int width = 0, height = 0;
+    int planes[3] = {}, frame = 0;
+    float color[15] = {};
+
+    ~Rife()
+    {
+        delete in;
+        delete out;
+    }
+
+    ncnn::Pipeline* pipeline(const char* data, int size, int x, int y, int z)
+    {
+        std::vector<uint32_t> spirv;
+        if (ncnn::compile_spirv_module(data, size, flownet.opt, spirv))
+            return nullptr;
+        ncnn::Pipeline* pipeline = new ncnn::Pipeline(gpu);
+        pipeline->set_optimal_local_size_xyz(x, y, z);
+        pipeline->create(spirv.data(), spirv.size() * 4, {});
+        return pipeline;
+    }
+
+    bool load(const std::string& folder)
+    {
+        gpu = ncnn::get_gpu_device(ncnn::get_default_gpu_index());
+        ncnn::Option& opt = flownet.opt;
+        opt.use_vulkan_compute = true;
+        // the shaders of the graph read halves only from fp16 storage
+        opt.use_fp16_storage = opt.use_fp16_packed = gpu->info.support_fp16_storage();
+        // amd and intel gpus do fp16 math at up to twice the rate of fp32
+        opt.use_fp16_arithmetic = true;
+        opt.use_int8_storage = false;
+        // the gemm kernels on cooperative matrices beat winograd
+        opt.use_winograd_convolution = !gpu->info.support_cooperative_matrix();
+        flownet.set_vulkan_device(gpu);
+        flownet.register_custom_layer("rife.Warp", make_warp);
+        Graph::keep(flownet);
+        FILE* param = open((folder + "/flownet.param").c_str());
+        FILE* model = open((folder + "/flownet.bin").c_str());
+        const bool loaded = param && model && flownet.load_param(param) == 0 && flownet.load_model(model) == 0;
+        if (param)
+            fclose(param);
+        if (model)
+            fclose(model);
+        // the newer models take the picture in larger steps of size
+        padding = folder.find("rife-v4.25-lite") != std::string::npos ? 128
+            : folder.find("rife-v4.25") != std::string::npos || folder.find("rife-v4.26") != std::string::npos ? 64
+            : 32;
+        in = pipeline(yuv_in_comp_data, sizeof(yuv_in_comp_data), 8, 8, 1);
+        out = pipeline(yuv_out_comp_data, sizeof(yuv_out_comp_data), 64, 1, 1);
+        return loaded && in && out && graph.load(flownet);
+    }
+
+    void prepare(int w, int h, bool bt601, bool full)
+    {
+        width = w;
+        height = h;
+        const auto word = [](int bytes) { return (bytes + 3) / 4 * 4; };
+        planes[1] = word(w * h);
+        planes[2] = planes[1] + word(w * h / 4);
+        frame = planes[2] + word(w * h / 4);
+        const float kr = bt601 ? 0.299f : 0.2126f, kb = bt601 ? 0.114f : 0.0722f, kg = 1 - kr - kb;
+        const float luma = full ? 255 : 219, chroma = full ? 255 : 224;
+        const float rv = 2 * (1 - kr), bu = 2 * (1 - kb);
+        const float values[15] = { full ? 0.f : 16.f, 1 / luma, 1 / chroma, rv, bu * kb / kg, rv * kr / kg, bu, luma, chroma, kr, kg, kb, 1 / bu, 1 / rv };
+        std::copy(values, values + 15, color);
+    }
+
+    void pack(const Picture& picture, uint8_t* block, bool into)
+    {
+        for (int plane = 0; plane < 3; plane++) {
+            const int shift = plane > 0;
+            const size_t line = (size_t)width >> shift;
+            for (int y = 0; y < height >> shift; y++) {
+                uint8_t* outside = picture.data[plane] + y * picture.stride[plane];
+                uint8_t* inside = block + planes[plane] + y * line;
+                if (into)
+                    memcpy(inside, outside, line);
+                else
+                    memcpy(outside, inside, line);
+            }
+        }
+    }
+
+    int process(const Picture& first, const Picture& second, float time, const Picture& output)
+    {
+        const int wide = (width + padding - 1) / padding * padding;
+        const int high = (height + padding - 1) / padding * padding;
+        std::vector<uint8_t> bytes[3] = { std::vector<uint8_t>(frame), std::vector<uint8_t>(frame), std::vector<uint8_t>(frame) };
+        pack(first, bytes[0].data(), true);
+        pack(second, bytes[1].data(), true);
+
+        const Turn turn(busy, room, working);
+        ncnn::VkAllocator* blobs = gpu->acquire_blob_allocator();
+        ncnn::VkAllocator* staging = gpu->acquire_staging_allocator();
+        ncnn::Option opt = flownet.opt;
+        opt.blob_vkallocator = blobs;
+        opt.workspace_vkallocator = blobs;
+        opt.staging_vkallocator = staging;
+        const size_t element = opt.use_fp16_storage ? 2u : 4u;
+        ncnn::VkCompute cmd(gpu);
+
+        ncnn::VkMat frames[2];
+        for (int index = 0; index < 2; index++) {
+            ncnn::VkMat uploaded;
+            cmd.record_clone(ncnn::Mat(frame / 4, (void*)bytes[index].data(), (size_t)4u), uploaded, opt);
+            frames[index].create(wide, high, 3, element, 1, blobs);
+            std::vector<ncnn::vk_constant_type> constants(14);
+            const int sizes[7] = { width, height, planes[1], planes[2], wide, high, (int)frames[index].cstep };
+            for (int i = 0; i < 7; i++)
+                constants[i].i = sizes[i];
+            for (int i = 0; i < 7; i++)
+                constants[7 + i].f = color[i];
+            ncnn::VkMat dispatcher;
+            dispatcher.w = wide;
+            dispatcher.h = high;
+            dispatcher.c = 1;
+            cmd.record_pipeline(in, { uploaded, frames[index] }, constants, dispatcher);
+        }
+        ncnn::VkMat result;
+        if (graph.run(frames, time, result, cmd, opt)) {
+            gpu->reclaim_blob_allocator(blobs);
+            gpu->reclaim_staging_allocator(staging);
+            return 1;
+        }
+
+        ncnn::VkMat packed;
+        packed.create(frame / 4, (size_t)4u, 1, blobs);
+        for (int chroma = 0; chroma < 2; chroma++) {
+            std::vector<ncnn::vk_constant_type> constants(15);
+            const int sizes[7] = { width, height, (int)result.cstep, result.w, chroma, planes[1], planes[2] };
+            for (int i = 0; i < 7; i++)
+                constants[i].i = sizes[i];
+            constants[7].f = color[0];
+            for (int i = 0; i < 7; i++)
+                constants[8 + i].f = color[7 + i];
+            ncnn::VkMat dispatcher;
+            dispatcher.w = chroma ? (width / 2 * (height / 2) + 3) / 4 : (width * height + 3) / 4;
+            dispatcher.h = 1;
+            dispatcher.c = 1;
+            cmd.record_pipeline(out, { result, packed }, constants, dispatcher);
+        }
+        ncnn::Mat downloaded(frame / 4, (void*)bytes[2].data(), (size_t)4u);
+        cmd.record_clone(packed, downloaded, opt);
+        // the nvidia driver lost the gpu with a scheduler error when frames ran on several queues at once
+        static std::mutex queue;
+        std::unique_lock<std::mutex> submit(queue);
+        const int failed = cmd.submit_and_wait();
+        submit.unlock();
+        gpu->reclaim_blob_allocator(blobs);
+        gpu->reclaim_staging_allocator(staging);
+        if (failed)
+            return 1;
+        pack(output, bytes[2].data(), false);
+        return 0;
+    }
+};
+
+std::mutex lock;
+std::set<Rife*> alive;
+
+// ncnn destroys the gpu at exit, and the nvidia driver corrupted its heap when pipelines were still alive then
+void release()
+{
+    const std::lock_guard<std::mutex> guard(lock);
+    for (Rife* rife : alive)
+        delete rife;
+    alive.clear();
+}
+
+}
+
 EXPORT void* rife_create(const char* models)
 {
     ncnn::create_gpu_instance();
     if (ncnn::get_gpu_count() == 0)
         return nullptr;
-
-    // the newer models take the picture in larger steps of size
-    const std::string name(models);
-    const int padding = name.find("rife-v4.25-lite") != std::string::npos ? 128
-        : name.find("rife-v4.25") != std::string::npos || name.find("rife-v4.26") != std::string::npos ? 64
-        : 32;
-    RIFE* rife = new RIFE(ncnn::get_default_gpu_index(), false, false, false, 1, false, true, padding);
-#if _WIN32
-    std::wstring path(MultiByteToWideChar(CP_UTF8, 0, models, -1, nullptr, 0), 0);
-    MultiByteToWideChar(CP_UTF8, 0, models, -1, path.data(), (int)path.size());
-    path.resize(path.size() - 1);
-#else
-    const std::string& path = name;
-#endif
-    if (rife->load(path) != 0)
-    {
+    // exit handlers run in reverse, so this one runs before the one of ncnn
+    static const int registered = atexit(release);
+    (void)registered;
+    Rife* rife = new Rife;
+    if (!rife->load(models)) {
         delete rife;
         return nullptr;
     }
+    const std::lock_guard<std::mutex> guard(lock);
+    alive.insert(rife);
     return rife;
 }
 
-// the engine of ncnn needs no build, the call is here so both plugins have the same set
-EXPORT int rife_prepare(void*, int, int, void (*)(void*, float), void*)
+// ncnn has nothing to build
+EXPORT int rife_prepare(void* rife, int width, int height, int bt601, int full, void (*)(void*, float), void*)
 {
+    ((Rife*)rife)->prepare(width, height, bt601, full);
     return 0;
 }
 
-EXPORT int rife_process(void* rife, const uint8_t* first, const uint8_t* second, int width, int height, float time, uint8_t* output)
+EXPORT int rife_process(void* rife, const Picture* first, const Picture* second, float time, const Picture* output)
 {
-    // ncnn loses the gpu when two rife objects run at the same time
-    static std::mutex gpu;
-    const std::lock_guard<std::mutex> lock(gpu);
-    const ncnn::Mat a(width, height, (void*)first, (size_t)3, 3);
-    const ncnn::Mat b(width, height, (void*)second, (size_t)3, 3);
-    ncnn::Mat out(width, height, (void*)output, (size_t)3, 3);
-    return ((RIFE*)rife)->process_v4(a, b, time, out);
+    return ((Rife*)rife)->process(*first, *second, time, *output);
 }
 
 EXPORT void rife_destroy(void* rife)
 {
-    delete (RIFE*)rife;
+    const std::lock_guard<std::mutex> guard(lock);
+    alive.erase((Rife*)rife);
+    delete (Rife*)rife;
 }
 
 // ncnn tells nothing more than the result of a call

@@ -1,0 +1,65 @@
+// moves each pixel of an image by its flow, bilinear and held inside the picture, the coordinates in fp32
+
+#version 450
+
+#if NCNN_fp16_storage
+#extension GL_EXT_shader_16bit_storage: require
+#endif
+
+layout (binding = 0) readonly buffer image_blob { sfp image_data[]; };
+layout (binding = 1) readonly buffer flow_blob { sfp flow_data[]; };
+layout (binding = 2) writeonly buffer out_blob { sfp out_data[]; };
+
+layout (push_constant) uniform parameter
+{
+    int w;
+    int h;
+    int channels;
+    int image_pack;
+    int image_step;
+    int image_from;
+    int flow_pack;
+    int flow_step;
+    int flow_from;
+    int out_pack;
+    int out_step;
+    int out_from;
+} p;
+
+// where channel c starts, the pixels of a channel lie pack apart
+int base(int pack, int step, int c)
+{
+    return pack == 4 ? (c >> 2) * step * 4 + (c & 3) : c * step;
+}
+
+void main()
+{
+    const int x = int(gl_GlobalInvocationID.x);
+    const int y = int(gl_GlobalInvocationID.y);
+
+    if (x >= p.w || y >= p.h)
+        return;
+
+    const int i = y * p.w + x;
+    const float sx = float(x) + float(flow_data[base(p.flow_pack, p.flow_step, p.flow_from) + i * p.flow_pack]);
+    const float sy = float(y) + float(flow_data[base(p.flow_pack, p.flow_step, p.flow_from + 1) + i * p.flow_pack]);
+    const int x0 = int(floor(sx));
+    const int y0 = int(floor(sy));
+    const int left = clamp(x0, 0, p.w - 1);
+    const int right = clamp(x0 + 1, 0, p.w - 1);
+    const int top = clamp(y0, 0, p.h - 1) * p.w;
+    const int bottom = clamp(y0 + 1, 0, p.h - 1) * p.w;
+    const float ax = sx - float(left);
+    const float ay = sy - float(clamp(y0, 0, p.h - 1));
+
+    for (int c = 0; c < p.channels; c++)
+    {
+        const int from = base(p.image_pack, p.image_step, p.image_from + c);
+        const float a = float(image_data[from + (top + left) * p.image_pack]);
+        const float b = float(image_data[from + (top + right) * p.image_pack]);
+        const float d = float(image_data[from + (bottom + left) * p.image_pack]);
+        const float e = float(image_data[from + (bottom + right) * p.image_pack]);
+        const float v = (a * (1.0 - ax) + b * ax) * (1.0 - ay) + (d * (1.0 - ax) + e * ax) * ay;
+        out_data[base(p.out_pack, p.out_step, p.out_from + c) + i * p.out_pack] = sfp(v);
+    }
+}

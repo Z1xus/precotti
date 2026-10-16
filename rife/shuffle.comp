@@ -1,0 +1,45 @@
+// depth to space, the channel of an output pixel is (c * factor + dy) * factor + dx
+
+#version 450
+
+#if NCNN_fp16_storage
+#extension GL_EXT_shader_16bit_storage: require
+#endif
+
+layout (binding = 0) readonly buffer in_blob { sfp in_data[]; };
+layout (binding = 1) writeonly buffer out_blob { sfp out_data[]; };
+
+layout (push_constant) uniform parameter
+{
+    int w;
+    int h;
+    int channels;
+    int in_pack;
+    int in_step;
+    int out_pack;
+    int out_step;
+    int out_from;
+    int lanes;
+    int factor;
+} p;
+
+// a pack holds 1 or 4 channels, so shifts do the division
+int at(int pack, int step, int c, int i)
+{
+    return pack == 4 ? ((c >> 2) * step + i) * 4 + (c & 3) : c * step + i;
+}
+
+void main()
+{
+    const int x = int(gl_GlobalInvocationID.x) / p.lanes;
+    const int y = int(gl_GlobalInvocationID.y);
+    const int c = int(gl_GlobalInvocationID.z) * p.lanes + int(gl_GlobalInvocationID.x) % p.lanes;
+
+    const int f = p.factor;
+    if (x >= p.w * f || y >= p.h * f || c >= p.channels)
+        return;
+
+    const int q = (c * f + y % f) * f + x % f;
+    const float v = float(in_data[at(p.in_pack, p.in_step, q, (y / f) * p.w + x / f)]);
+    out_data[at(p.out_pack, p.out_step, p.out_from + c, y * p.w * f + x)] = sfp(v);
+}

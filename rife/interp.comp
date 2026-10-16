@@ -1,0 +1,109 @@
+// bilinear resize like ncnn with half pixel centers, the coordinates in fp32
+
+#version 450
+
+#if NCNN_fp16_storage
+#extension GL_EXT_shader_16bit_storage: require
+#endif
+
+// whole packs of four, one value goes through its component
+layout (binding = 0) readonly buffer in_blob { sfpvec4 in_data4[]; };
+layout (binding = 1) writeonly buffer out_blob { sfpvec4 out_data4[]; };
+
+layout (push_constant) uniform parameter
+{
+    int w;
+    int h;
+    int in_pack;
+    int in_step;
+    int in_from;
+    int outw;
+    int outh;
+    int out_pack;
+    int out_step;
+    int out_from;
+    int channels;
+    int lanes;
+    float scale_x;
+    float scale_y;
+    float k;
+} p;
+
+// a pack holds 1 or 4 channels, so shifts do the division
+float get(int i)
+{
+    return float(in_data4[i >> 2][i & 3]);
+}
+
+void put(int i, float v)
+{
+    out_data4[i >> 2][i & 3] = sfp(v);
+}
+
+int at(int pack, int step, int c, int i)
+{
+    return pack == 4 ? ((c >> 2) * step + i) * 4 + (c & 3) : c * step + i;
+}
+
+// the left sample and its weight, held inside the picture
+ivec2 pick(int x, float scale, int size, out float f)
+{
+    float s = (float(x) + 0.5) * scale - 0.5;
+    int i = int(floor(s));
+    f = s - float(i);
+    if (i < 0)
+    {
+        i = 0;
+        f = 0.0;
+    }
+    else if (i > size - 2)
+    {
+        i = max(size - 2, 0);
+        f = size > 1 ? 1.0 : 0.0;
+    }
+    return ivec2(i, min(i + 1, size - 1));
+}
+
+// four channels of one pixel, whole when the input holds them in one pack
+vec4 texel(int c, int i)
+{
+    const int ch = p.in_from + c;
+    if (p.in_pack == 4 && ch % 4 == 0)
+        return vec4(in_data4[(ch / 4) * p.in_step + i]);
+    vec4 v;
+    for (int k = 0; k < 4; k++)
+        v[k] = get(at(p.in_pack, p.in_step, ch + k, i));
+    return v;
+}
+
+void main()
+{
+    const int x = int(gl_GlobalInvocationID.x);
+    const int y = int(gl_GlobalInvocationID.y);
+    const int c = int(gl_GlobalInvocationID.z) * p.lanes;
+
+    if (x >= p.outw || y >= p.outh || c >= p.channels)
+        return;
+
+    float fx;
+    float fy;
+    const ivec2 sx = pick(x, p.scale_x, p.w, fx);
+    const ivec2 sy = pick(y, p.scale_y, p.h, fy);
+    const int i = y * p.outw + x;
+    if (p.lanes == 4)
+    {
+        const vec4 v = mix(mix(texel(c, sy.x * p.w + sx.x), texel(c, sy.x * p.w + sx.y), fx), mix(texel(c, sy.y * p.w + sx.x), texel(c, sy.y * p.w + sx.y), fx), fy);
+        out_data4[((p.out_from + c) / 4) * p.out_step + i] = sfpvec4(v * p.k);
+        return;
+    }
+    // one pixel for all channels, the samples and weights are the same for each
+    for (int k = 0; k < p.channels; k++)
+    {
+        const int ch = p.in_from + k;
+        const float a = get(at(p.in_pack, p.in_step, ch, sy.x * p.w + sx.x));
+        const float b = get(at(p.in_pack, p.in_step, ch, sy.x * p.w + sx.y));
+        const float d = get(at(p.in_pack, p.in_step, ch, sy.y * p.w + sx.x));
+        const float e = get(at(p.in_pack, p.in_step, ch, sy.y * p.w + sx.y));
+        put(at(p.out_pack, p.out_step, p.out_from + k, i), mix(mix(a, b, fx), mix(d, e, fx), fy) * p.k);
+    }
+}
