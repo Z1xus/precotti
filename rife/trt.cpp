@@ -14,8 +14,6 @@ struct Picture {
     int id;
 };
 
-// the largest side of the engine
-const int LARGEST = 4096;
 const char* const INPUTS[6] = { "first_y", "first_u", "first_v", "second_y", "second_u", "second_v" };
 const char* const OUTPUTS[3] = { "y", "u", "v" };
 enum { TIME, LUMA, LUMA_SCALE, CHROMA_SCALE, R_V, G_U, G_V, B_U, K_R, K_G, K_B, U_B, V_R, LUMA_RANGE, CHROMA_RANGE, VALUES };
@@ -79,7 +77,7 @@ struct Wrap {
         return output;
     }
 
-    bool operator()(INetworkDefinition& net, IOptimizationProfile& profile, int width, int height)
+    bool operator()(INetworkDefinition& net, IOptimizationProfile& profile, int width, int height, int side)
     {
         network = &net;
         // removeTensor on an input fails in tensorrt 10.9, so the input is reused
@@ -105,7 +103,7 @@ struct Wrap {
                 ITensor* input = net.addInput(INPUTS[frame * 3 + plane], DataType::kUINT8, Dims4(1, 1, -1, -1));
                 profile.setDimensions(input->getName(), OptProfileSelector::kMIN, Dims4(1, 1, 1, 1));
                 profile.setDimensions(input->getName(), OptProfileSelector::kOPT, Dims4(1, 1, height >> shift, width >> shift));
-                profile.setDimensions(input->getName(), OptProfileSelector::kMAX, Dims4(1, 1, LARGEST >> shift, LARGEST >> shift));
+                profile.setDimensions(input->getName(), OptProfileSelector::kMAX, Dims4(1, 1, side >> shift, side >> shift));
                 planes[plane] = net.addCast(*input, DataType::kFLOAT)->getOutput(0);
                 if (shift) {
                     IResizeLayer* resize = net.addResize(*planes[plane]);
@@ -226,10 +224,6 @@ struct Rife {
         failure.clear();
         width = w;
         height = h;
-        if (w > LARGEST || h > LARGEST) {
-            failure = "the video is larger than " + std::to_string(LARGEST) + " pixels on a side";
-            return false;
-        }
         // tensorrt wants tensors on 256 bytes
         const auto align = [](size_t bytes) { return (bytes + 255) / 256 * 256; };
         planes[1] = align((size_t)w * h);
@@ -245,8 +239,15 @@ struct Rife {
         if (!runtime)
             return false;
         Wrap wrap;
-        const Edit edit = [&](INetworkDefinition& network, IOptimizationProfile& profile) { return wrap(network, profile, w, h); };
-        const auto fits = [](ICudaEngine& engine) { return engine.getTensorIOMode("settings") == TensorIOMode::kINPUT; };
+        // any size up to a square of this side, a larger video builds again; at 4096 the larger models ran out of gpu memory
+        const int side = (std::max({ w, h, 1920 }) + 63) / 64 * 64;
+        const Edit edit = [&](INetworkDefinition& network, IOptimizationProfile& profile) { return wrap(network, profile, w, h, side); };
+        const auto fits = [&](ICudaEngine& engine) {
+            if (engine.getTensorIOMode("settings") != TensorIOMode::kINPUT)
+                return false;
+            const Dims largest = engine.getProfileShape(INPUTS[0], 0, OptProfileSelector::kMAX);
+            return largest.d[2] >= h && largest.d[3] >= w;
+        };
         engine = load_engine(runtime, folder / "rife.onnx", folder / "rife.engine", edit, fits, monitor);
         if (!engine)
             return false;
