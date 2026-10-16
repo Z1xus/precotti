@@ -94,6 +94,8 @@ struct Rife {
     int padding = 32;
     int width = 0, height = 0;
     int planes[3] = {}, frame = 0;
+    // 1 when the color planes are half the size of the picture
+    int half = 1;
     float color[15] = {};
 
     ~Rife()
@@ -144,14 +146,16 @@ struct Rife {
         return loaded && in && out && graph.load(flownet);
     }
 
-    void prepare(int w, int h, bool bt601, bool full)
+    void prepare(int w, int h, bool bt601, bool full, bool yuv444)
     {
         width = w;
         height = h;
+        half = !yuv444;
         const auto word = [](int bytes) { return (bytes + 3) / 4 * 4; };
+        const int area = (w >> half) * (h >> half);
         planes[1] = word(w * h);
-        planes[2] = planes[1] + word(w * h / 4);
-        frame = planes[2] + word(w * h / 4);
+        planes[2] = planes[1] + word(area);
+        frame = planes[2] + word(area);
         const float kr = bt601 ? 0.299f : 0.2126f, kb = bt601 ? 0.114f : 0.0722f, kg = 1 - kr - kb;
         const float luma = full ? 255 : 219, chroma = full ? 255 : 224;
         const float rv = 2 * (1 - kr), bu = 2 * (1 - kb);
@@ -162,7 +166,7 @@ struct Rife {
     void pack(const Picture& picture, uint8_t* block, bool into)
     {
         for (int plane = 0; plane < 3; plane++) {
-            const int shift = plane > 0;
+            const int shift = plane > 0 ? half : 0;
             const size_t line = (size_t)width >> shift;
             for (int y = 0; y < height >> shift; y++) {
                 uint8_t* outside = picture.data[plane] + y * picture.stride[plane];
@@ -198,12 +202,12 @@ struct Rife {
             ncnn::VkMat uploaded;
             cmd.record_clone(ncnn::Mat(frame / 4, (void*)bytes[index].data(), (size_t)4u), uploaded, opt);
             frames[index].create(wide, high, 3, element, 1, blobs);
-            std::vector<ncnn::vk_constant_type> constants(14);
-            const int sizes[7] = { width, height, planes[1], planes[2], wide, high, (int)frames[index].cstep };
-            for (int i = 0; i < 7; i++)
+            std::vector<ncnn::vk_constant_type> constants(15);
+            const int sizes[8] = { width, height, planes[1], planes[2], half, wide, high, (int)frames[index].cstep };
+            for (int i = 0; i < 8; i++)
                 constants[i].i = sizes[i];
             for (int i = 0; i < 7; i++)
-                constants[7 + i].f = color[i];
+                constants[8 + i].f = color[i];
             ncnn::VkMat dispatcher;
             dispatcher.w = wide;
             dispatcher.h = high;
@@ -220,15 +224,15 @@ struct Rife {
         ncnn::VkMat packed;
         packed.create(frame / 4, (size_t)4u, 1, blobs);
         for (int chroma = 0; chroma < 2; chroma++) {
-            std::vector<ncnn::vk_constant_type> constants(15);
-            const int sizes[7] = { width, height, (int)result.cstep, result.w, chroma, planes[1], planes[2] };
-            for (int i = 0; i < 7; i++)
+            std::vector<ncnn::vk_constant_type> constants(16);
+            const int sizes[8] = { width, height, (int)result.cstep, result.w, chroma, planes[1], planes[2], half };
+            for (int i = 0; i < 8; i++)
                 constants[i].i = sizes[i];
-            constants[7].f = color[0];
+            constants[8].f = color[0];
             for (int i = 0; i < 7; i++)
-                constants[8 + i].f = color[7 + i];
+                constants[9 + i].f = color[7 + i];
             ncnn::VkMat dispatcher;
-            dispatcher.w = chroma ? (width / 2 * (height / 2) + 3) / 4 : (width * height + 3) / 4;
+            dispatcher.w = chroma ? ((width >> half) * (height >> half) + 3) / 4 : (width * height + 3) / 4;
             dispatcher.h = 1;
             dispatcher.c = 1;
             cmd.record_pipeline(out, { result, packed }, constants, dispatcher);
@@ -282,9 +286,9 @@ EXPORT void* rife_create(const char* models)
 }
 
 // ncnn has nothing to build
-EXPORT int rife_prepare(void* rife, int width, int height, int bt601, int full, void (*)(void*, float), void*)
+EXPORT int rife_prepare(void* rife, int width, int height, int bt601, int full, int yuv444, void (*)(void*, float), void*)
 {
-    ((Rife*)rife)->prepare(width, height, bt601, full);
+    ((Rife*)rife)->prepare(width, height, bt601, full, yuv444);
     return 0;
 }
 

@@ -77,7 +77,18 @@ struct Wrap {
         return output;
     }
 
-    bool operator()(INetworkDefinition& net, IOptimizationProfile& profile, int width, int height, int side)
+    // resizes to the size of another tensor, the color planes of 4:2:0 and 4:4:4 take the same engine
+    ITensor* resize(ITensor* tensor, ITensor* like)
+    {
+        IResizeLayer* layer = network->addResize(*tensor);
+        layer->setInput(1, *network->addShape(*like)->getOutput(0));
+        layer->setResizeMode(InterpolationMode::kLINEAR);
+        layer->setCoordinateTransformation(ResizeCoordinateTransformation::kHALF_PIXEL);
+        return layer->getOutput(0);
+    }
+
+    // half is 1 when the color planes are half the size of the picture, as in 4:2:0
+    bool operator()(INetworkDefinition& net, IOptimizationProfile& profile, int width, int height, int half, int side)
     {
         network = &net;
         // removeTensor on an input fails in tensorrt 10.9, so the input is reused
@@ -96,22 +107,19 @@ struct Wrap {
         auto at = [&](int index) { return value(values, index); };
 
         ITensor* rgb[2];
+        ITensor* color = nullptr;
         for (int frame = 0; frame < 2; frame++) {
             ITensor* planes[3];
             for (int plane = 0; plane < 3; plane++) {
-                const int shift = plane > 0;
+                const int shift = plane > 0 ? half : 0;
                 ITensor* input = net.addInput(INPUTS[frame * 3 + plane], DataType::kUINT8, Dims4(1, 1, -1, -1));
                 profile.setDimensions(input->getName(), OptProfileSelector::kMIN, Dims4(1, 1, 1, 1));
                 profile.setDimensions(input->getName(), OptProfileSelector::kOPT, Dims4(1, 1, height >> shift, width >> shift));
-                profile.setDimensions(input->getName(), OptProfileSelector::kMAX, Dims4(1, 1, side >> shift, side >> shift));
+                profile.setDimensions(input->getName(), OptProfileSelector::kMAX, Dims4(1, 1, side, side));
                 planes[plane] = net.addCast(*input, DataType::kFLOAT)->getOutput(0);
-                if (shift) {
-                    IResizeLayer* resize = net.addResize(*planes[plane]);
-                    const float scales[4] = { 1, 1, 2, 2 };
-                    resize->setScales(scales, 4);
-                    resize->setResizeMode(InterpolationMode::kLINEAR);
-                    resize->setCoordinateTransformation(ResizeCoordinateTransformation::kHALF_PIXEL);
-                    planes[plane] = product(sum(resize->getOutput(0), constant(-128)), at(CHROMA_SCALE));
+                if (plane > 0) {
+                    color = color ? color : input;
+                    planes[plane] = product(sum(resize(planes[plane], planes[0]), constant(-128)), at(CHROMA_SCALE));
                 }
             }
             ITensor* y = product(sum(planes[0], product(at(LUMA), constant(-1))), at(LUMA_SCALE));
@@ -141,11 +149,9 @@ struct Wrap {
         ITensor* y = sum(sum(product(at(K_R), r), product(at(K_G), g)), product(at(K_B), b));
         bytes(sum(product(y, at(LUMA_RANGE)), at(LUMA)), OUTPUTS[0]);
         ITensor* chroma[2] = { product(math(b, y, ElementWiseOperation::kSUB), at(U_B)), product(math(r, y, ElementWiseOperation::kSUB), at(V_R)) };
-        for (int plane = 0; plane < 2; plane++) {
-            IPoolingLayer* pool = net.addPoolingNd(*chroma[plane], PoolingType::kAVERAGE, DimsHW(2, 2));
-            pool->setStrideNd(DimsHW(2, 2));
-            bytes(sum(product(pool->getOutput(0), at(CHROMA_RANGE)), constant(128)), OUTPUTS[plane + 1]);
-        }
+        // at half the size the bilinear samples at half pixels are the mean of each 2x2 block
+        for (int plane = 0; plane < 2; plane++)
+            bytes(sum(product(resize(chroma[plane], color), at(CHROMA_RANGE)), constant(128)), OUTPUTS[plane + 1]);
         return true;
     }
 };
@@ -182,6 +188,8 @@ struct Rife {
     ICudaEngine* engine = nullptr;
     int width = 0, height = 0;
     size_t planes[3] = {}, frame = 0;
+    // 1 when the color planes are half the size of the picture
+    int half = 1;
     float values[VALUES] = {};
     std::vector<Slot*> slots, idle;
     std::mutex lock;
@@ -203,7 +211,7 @@ struct Rife {
         if (!(slot->context = engine->createExecutionContext(ExecutionContextAllocationStrategy::kUSER_MANAGED)))
             return nullptr;
         for (int input = 0; input < 6; input++) {
-            const int shift = input % 3 > 0;
+            const int shift = input % 3 > 0 ? half : 0;
             if (!slot->context->setInputShape(INPUTS[input], Dims4(1, 1, height >> shift, width >> shift)))
                 return nullptr;
         }
@@ -219,21 +227,23 @@ struct Rife {
         return slot;
     }
 
-    bool prepare(int w, int h, bool bt601, bool full)
+    bool prepare(int w, int h, bool bt601, bool full, bool yuv444)
     {
         failure.clear();
         width = w;
         height = h;
+        half = !yuv444;
         // tensorrt wants tensors on 256 bytes
         const auto align = [](size_t bytes) { return (bytes + 255) / 256 * 256; };
+        const size_t color = (size_t)(w >> half) * (h >> half);
         planes[1] = align((size_t)w * h);
-        planes[2] = planes[1] + align((size_t)w * h / 4);
-        frame = planes[2] + align((size_t)w * h / 4);
+        planes[2] = planes[1] + align(color);
+        frame = planes[2] + align(color);
         const float kr = bt601 ? 0.299f : 0.2126f, kb = bt601 ? 0.114f : 0.0722f, kg = 1 - kr - kb;
         const float luma = full ? 255 : 219, chroma = full ? 255 : 224;
         const float rv = 2 * (1 - kr), bu = 2 * (1 - kb);
-        const float color[VALUES] = { 0, full ? 0.f : 16.f, 1 / luma, 1 / chroma, rv, bu * kb / kg, rv * kr / kg, bu, kr, kg, kb, 1 / bu, 1 / rv, luma, chroma };
-        std::copy(color, color + VALUES, values);
+        const float numbers[VALUES] = { 0, full ? 0.f : 16.f, 1 / luma, 1 / chroma, rv, bu * kb / kg, rv * kr / kg, bu, kr, kg, kb, 1 / bu, 1 / rv, luma, chroma };
+        std::copy(numbers, numbers + VALUES, values);
 
         runtime = (IRuntime*)create_runtime(&logger, NV_TENSORRT_VERSION);
         if (!runtime)
@@ -241,12 +251,13 @@ struct Rife {
         Wrap wrap;
         // any size up to a square of this side, a larger video builds again; at 4096 the larger models ran out of gpu memory
         const int side = (std::max({ w, h, 1920 }) + 63) / 64 * 64;
-        const Edit edit = [&](INetworkDefinition& network, IOptimizationProfile& profile) { return wrap(network, profile, w, h, side); };
+        const Edit edit = [&](INetworkDefinition& network, IOptimizationProfile& profile) { return wrap(network, profile, w, h, half, side); };
         const auto fits = [&](ICudaEngine& engine) {
             if (engine.getTensorIOMode("settings") != TensorIOMode::kINPUT)
                 return false;
-            const Dims largest = engine.getProfileShape(INPUTS[0], 0, OptProfileSelector::kMAX);
-            return largest.d[2] >= h && largest.d[3] >= w;
+            const Dims luma = engine.getProfileShape(INPUTS[0], 0, OptProfileSelector::kMAX);
+            const Dims color = engine.getProfileShape(INPUTS[1], 0, OptProfileSelector::kMAX);
+            return luma.d[2] >= h && luma.d[3] >= w && color.d[2] >= h && color.d[3] >= w;
         };
         engine = load_engine(runtime, folder / "rife.onnx", folder / "rife.engine", edit, fits, monitor);
         if (!engine)
@@ -290,7 +301,7 @@ struct Rife {
     void pack(const Picture& picture, uint8_t* block, bool in)
     {
         for (int plane = 0; plane < 3; plane++) {
-            const int shift = plane > 0;
+            const int shift = plane > 0 ? half : 0;
             const size_t line = (size_t)width >> shift;
             for (int y = 0; y < height >> shift; y++) {
                 uint8_t* outside = picture.data[plane] + y * picture.stride[plane];
@@ -362,12 +373,12 @@ EXPORT void* rife_create(const char* models)
     return rife;
 }
 
-EXPORT int rife_prepare(void* rife, int width, int height, int bt601, int full, void (*report)(void*, float), void* user)
+EXPORT int rife_prepare(void* rife, int width, int height, int bt601, int full, int yuv444, void (*report)(void*, float), void* user)
 {
     Rife* self = (Rife*)rife;
     self->monitor.report = report;
     self->monitor.user = user;
-    const bool ready = self->prepare(width, height, bt601, full);
+    const bool ready = self->prepare(width, height, bt601, full, yuv444);
     self->monitor.report = nullptr;
     return ready ? 0 : 1;
 }
