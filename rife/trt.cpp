@@ -227,9 +227,25 @@ struct Rife {
         return slot;
     }
 
+    // a rife that ran before keeps its engine, and its slots when the size is the same
     bool prepare(int w, int h, bool bt601, bool full, bool yuv444)
     {
         failure.clear();
+        const float kr = bt601 ? 0.299f : 0.2126f, kb = bt601 ? 0.114f : 0.0722f, kg = 1 - kr - kb;
+        const float luma = full ? 255 : 219, chroma = full ? 255 : 224;
+        const float rv = 2 * (1 - kr), bu = 2 * (1 - kb);
+        const float numbers[VALUES] = { 0, full ? 0.f : 16.f, 1 / luma, 1 / chroma, rv, bu * kb / kg, rv * kr / kg, bu, kr, kg, kb, 1 / bu, 1 / rv, luma, chroma };
+        std::copy(numbers, numbers + VALUES, values);
+        if (!slots.empty() && w == width && h == height && half == !yuv444) {
+            // the frames in the slots are from the clip before
+            for (Slot* slot : slots)
+                slot->held[0] = slot->held[1] = -1;
+            return true;
+        }
+        for (Slot* slot : slots)
+            delete slot;
+        slots.clear();
+        idle.clear();
         width = w;
         height = h;
         half = !yuv444;
@@ -239,14 +255,8 @@ struct Rife {
         planes[1] = align((size_t)w * h);
         planes[2] = planes[1] + align(color);
         frame = planes[2] + align(color);
-        const float kr = bt601 ? 0.299f : 0.2126f, kb = bt601 ? 0.114f : 0.0722f, kg = 1 - kr - kb;
-        const float luma = full ? 255 : 219, chroma = full ? 255 : 224;
-        const float rv = 2 * (1 - kr), bu = 2 * (1 - kb);
-        const float numbers[VALUES] = { 0, full ? 0.f : 16.f, 1 / luma, 1 / chroma, rv, bu * kb / kg, rv * kr / kg, bu, kr, kg, kb, 1 / bu, 1 / rv, luma, chroma };
-        std::copy(numbers, numbers + VALUES, values);
 
-        runtime = (IRuntime*)create_runtime(&logger, NV_TENSORRT_VERSION);
-        if (!runtime)
+        if (!runtime && !(runtime = (IRuntime*)create_runtime(&logger, NV_TENSORRT_VERSION)))
             return false;
         Wrap wrap;
         // any size up to a square of this side, a larger video builds again; at 4096 the larger models ran out of gpu memory
@@ -259,7 +269,10 @@ struct Rife {
             const Dims color = engine.getProfileShape(INPUTS[1], 0, OptProfileSelector::kMAX);
             return luma.d[2] >= h && luma.d[3] >= w && color.d[2] >= h && color.d[3] >= w;
         };
-        engine = load_engine(runtime, folder / "rife.onnx", folder / "rife.engine", edit, fits, monitor);
+        if (!engine || !fits(*engine)) {
+            delete engine;
+            engine = load_engine(runtime, folder / "rife.onnx", folder / "rife.engine", edit, fits, monitor);
+        }
         if (!engine)
             return false;
         // older plugins made one engine per size
