@@ -377,29 +377,51 @@ struct Rife {
 
 }
 
+// an exception must not leave the library, the app gets the error
+template <class F>
+auto guard(F body, decltype(body()) error) -> decltype(body())
+{
+    try {
+        return body();
+    } catch (const std::exception& e) {
+        failure = e.what();
+    } catch (...) {
+        failure = "unknown error";
+    }
+    return error;
+}
+
 EXPORT void* rife_create(const char* models)
 {
-    if (!load_libraries())
-        return nullptr;
-    Rife* rife = new Rife;
-    rife->folder = std::filesystem::u8path(models);
-    return rife;
+    return guard(
+        [&]() -> void* {
+            if (!load_libraries())
+                return nullptr;
+            Rife* rife = new Rife;
+            rife->folder = std::filesystem::u8path(models);
+            return rife;
+        },
+        nullptr);
 }
 
 EXPORT int rife_prepare(void* rife, int width, int height, int bt601, int full, int yuv444, void (*report)(void*, float), void* user)
 {
     Rife* self = (Rife*)rife;
-    self->monitor.report = report;
-    self->monitor.user = user;
-    const bool ready = self->prepare(width, height, bt601, full, yuv444);
-    self->monitor.report = nullptr;
-    return ready ? 0 : 1;
+    return guard(
+        [&] {
+            self->monitor.report = report;
+            self->monitor.user = user;
+            const bool ready = self->prepare(width, height, bt601, full, yuv444);
+            self->monitor.report = nullptr;
+            return ready ? 0 : 1;
+        },
+        1);
 }
 
 // thread safe
 EXPORT int rife_process(void* rife, const Picture* first, const Picture* second, float time, const Picture* output)
 {
-    return ((Rife*)rife)->process(*first, *second, time, *output);
+    return guard([&] { return ((Rife*)rife)->process(*first, *second, time, *output); }, 1);
 }
 
 EXPORT void rife_destroy(void* rife)

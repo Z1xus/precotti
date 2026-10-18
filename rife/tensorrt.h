@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -14,9 +15,12 @@
 #if _WIN32
 #define NOMINMAX
 #include <windows.h>
+#define PROCESS GetCurrentProcessId()
 #define EXPORT extern "C" __declspec(dllexport)
 #else
 #include <dlfcn.h>
+#include <unistd.h>
+#define PROCESS getpid()
 #define EXPORT extern "C" __attribute__((visibility("default")))
 #endif
 
@@ -109,38 +113,36 @@ void* symbol(void* library, const char* name)
 
 bool load_libraries()
 {
-    static int state = 0;
-    if (state != 0)
-        return state > 0;
-    state = -1;
-    const std::filesystem::path folder = here() / "tensorrt";
-    void* cuda = open(folder / CUDA);
-    void* infer = open(folder / INFER);
-    void* onnx = open(folder / ONNX);
-    if (!cuda || !infer || !onnx)
-        return false;
+    static const bool loaded = [] {
+        const std::filesystem::path folder = here() / "tensorrt";
+        void* cuda = open(folder / CUDA);
+        void* infer = open(folder / INFER);
+        void* onnx = open(folder / ONNX);
+        if (!cuda || !infer || !onnx)
+            return false;
 #if _WIN32
-    // tensorrt loads its builder resource by name only when it makes an engine
-    SetDllDirectoryW(folder.c_str());
+        // tensorrt loads its builder resource by name when it makes an engine, so it must be loaded already
+        if (!open(folder / L"nvinfer_builder_resource_10.dll"))
+            return false;
 #endif
-    create_builder = (decltype(create_builder))symbol(infer, "createInferBuilder_INTERNAL");
-    create_runtime = (decltype(create_runtime))symbol(infer, "createInferRuntime_INTERNAL");
-    create_parser = (decltype(create_parser))symbol(onnx, "createNvOnnxParser_INTERNAL");
-    cuda_malloc = (decltype(cuda_malloc))symbol(cuda, "cudaMalloc");
-    cuda_free = (decltype(cuda_free))symbol(cuda, "cudaFree");
-    cuda_malloc_host = (decltype(cuda_malloc_host))symbol(cuda, "cudaMallocHost");
-    cuda_free_host = (decltype(cuda_free_host))symbol(cuda, "cudaFreeHost");
-    cuda_memcpy = (decltype(cuda_memcpy))symbol(cuda, "cudaMemcpyAsync");
-    cuda_stream_create = (decltype(cuda_stream_create))symbol(cuda, "cudaStreamCreateWithFlags");
-    cuda_stream_destroy = (decltype(cuda_stream_destroy))symbol(cuda, "cudaStreamDestroy");
-    cuda_event_create = (decltype(cuda_event_create))symbol(cuda, "cudaEventCreateWithFlags");
-    cuda_event_record = (decltype(cuda_event_record))symbol(cuda, "cudaEventRecord");
-    cuda_event_wait = (decltype(cuda_event_wait))symbol(cuda, "cudaEventSynchronize");
-    cuda_event_destroy = (decltype(cuda_event_destroy))symbol(cuda, "cudaEventDestroy");
-    if (create_builder && create_runtime && create_parser && cuda_malloc && cuda_free && cuda_malloc_host && cuda_free_host && cuda_memcpy
-        && cuda_stream_create && cuda_stream_destroy && cuda_event_create && cuda_event_record && cuda_event_wait && cuda_event_destroy)
-        state = 1;
-    return state > 0;
+        create_builder = (decltype(create_builder))symbol(infer, "createInferBuilder_INTERNAL");
+        create_runtime = (decltype(create_runtime))symbol(infer, "createInferRuntime_INTERNAL");
+        create_parser = (decltype(create_parser))symbol(onnx, "createNvOnnxParser_INTERNAL");
+        cuda_malloc = (decltype(cuda_malloc))symbol(cuda, "cudaMalloc");
+        cuda_free = (decltype(cuda_free))symbol(cuda, "cudaFree");
+        cuda_malloc_host = (decltype(cuda_malloc_host))symbol(cuda, "cudaMallocHost");
+        cuda_free_host = (decltype(cuda_free_host))symbol(cuda, "cudaFreeHost");
+        cuda_memcpy = (decltype(cuda_memcpy))symbol(cuda, "cudaMemcpyAsync");
+        cuda_stream_create = (decltype(cuda_stream_create))symbol(cuda, "cudaStreamCreateWithFlags");
+        cuda_stream_destroy = (decltype(cuda_stream_destroy))symbol(cuda, "cudaStreamDestroy");
+        cuda_event_create = (decltype(cuda_event_create))symbol(cuda, "cudaEventCreateWithFlags");
+        cuda_event_record = (decltype(cuda_event_record))symbol(cuda, "cudaEventRecord");
+        cuda_event_wait = (decltype(cuda_event_wait))symbol(cuda, "cudaEventSynchronize");
+        cuda_event_destroy = (decltype(cuda_event_destroy))symbol(cuda, "cudaEventDestroy");
+        return create_builder && create_runtime && create_parser && cuda_malloc && cuda_free && cuda_malloc_host && cuda_free_host && cuda_memcpy
+            && cuda_stream_create && cuda_stream_destroy && cuda_event_create && cuda_event_record && cuda_event_wait && cuda_event_destroy;
+    }();
+    return loaded;
 }
 
 // these two phases take almost all of the build
@@ -183,19 +185,42 @@ std::vector<char> read(const std::filesystem::path& file)
     return { std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>() };
 }
 
+// a file appears complete or not at all, also when two processes write it
+bool write(const std::filesystem::path& file, const void* data, size_t size)
+{
+    std::filesystem::path part = file;
+    part += "." + std::to_string(PROCESS) + ".part";
+    std::ofstream stream(part, std::ios::binary);
+    stream.write((const char*)data, (std::streamsize)size);
+    stream.close();
+    std::error_code error;
+    if (stream.good())
+        std::filesystem::rename(part, file, error);
+    if (!stream.good() || error) {
+        std::filesystem::remove(part, error);
+        return false;
+    }
+    return true;
+}
+
 std::vector<char> build(const std::filesystem::path& onnx, const std::filesystem::path& name, const Edit& edit, Monitor& monitor)
 {
     std::vector<char> plan;
     IBuilder* builder = (IBuilder*)create_builder(&logger, NV_TENSORRT_VERSION);
-    if (!builder)
+    if (!builder) {
+        failure = "tensorrt could not start";
         return plan;
+    }
     INetworkDefinition* network = builder->createNetworkV2(0);
-    nvonnxparser::IParser* parser = (nvonnxparser::IParser*)create_parser(network, &logger, NV_ONNX_PARSER_VERSION);
+    nvonnxparser::IParser* parser = network ? (nvonnxparser::IParser*)create_parser(network, &logger, NV_ONNX_PARSER_VERSION) : nullptr;
     IBuilderConfig* config = builder->createBuilderConfig();
+    IOptimizationProfile* profile = builder->createOptimizationProfile();
     // the parser gets the bytes, it cannot open a path with letters outside of ascii on windows
     const std::vector<char> model = read(onnx);
-    IOptimizationProfile* profile = builder->createOptimizationProfile();
-    if (parser && parser->parse(model.data(), model.size()) && edit(*network, *profile)) {
+    if (!network || !parser || !config || !profile) {
+        if (failure.empty())
+            failure = "tensorrt could not set up the build";
+    } else if (parser->parse(model.data(), model.size()) && edit(*network, *profile)) {
         config->addOptimizationProfile(profile);
         config->setFlag(BuilderFlag::kFP16);
         config->setProgressMonitor(&monitor);
@@ -203,22 +228,25 @@ std::vector<char> build(const std::filesystem::path& onnx, const std::filesystem
         const std::filesystem::path learned = onnx.parent_path().parent_path() / "timing.cache";
         const std::vector<char> known = read(learned);
         ITimingCache* cache = config->createTimingCache(known.data(), known.size());
-        config->setTimingCache(*cache, true);
-        if (IHostMemory* memory = builder->buildSerializedNetwork(*network, *config)) {
-            plan.assign((const char*)memory->data(), (const char*)memory->data() + memory->size());
-            delete memory;
-            // the app can build the same engine two times at once, so the file appears complete
-            std::filesystem::path part = name;
-            part += ".part";
-            std::ofstream(part, std::ios::binary).write(plan.data(), (std::streamsize)plan.size());
-            std::error_code failed;
-            std::filesystem::rename(part, name, failed);
-            if (IHostMemory* timing = cache->serialize()) {
-                std::ofstream(learned, std::ios::binary).write((const char*)timing->data(), (std::streamsize)timing->size());
-                delete timing;
+        // a cache that is torn or from another gpu is not used
+        if (!cache)
+            cache = config->createTimingCache(nullptr, 0);
+        if (!cache)
+            failure = "tensorrt could not make a timing cache";
+        else {
+            config->setTimingCache(*cache, true);
+            if (IHostMemory* memory = builder->buildSerializedNetwork(*network, *config)) {
+                plan.assign((const char*)memory->data(), (const char*)memory->data() + memory->size());
+                delete memory;
+                // the app can build the same engine two times at once, so the file appears complete
+                write(name, plan.data(), plan.size());
+                if (IHostMemory* timing = cache->serialize()) {
+                    write(learned, timing->data(), timing->size());
+                    delete timing;
+                }
             }
+            delete cache;
         }
-        delete cache;
     }
     delete config;
     delete parser;
