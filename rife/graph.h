@@ -13,7 +13,10 @@ public:
     // the net must make its layers with this, before it loads the model
     static void keep(ncnn::Net& net);
     bool load(ncnn::Net& net);
-    int run(const ncnn::VkMat (&frames)[2], float time, ncnn::VkMat& output, ncnn::VkCompute& cmd, const ncnn::Option& opt);
+    ncnn::VkMat feature(int role, int w, int h, const ncnn::Option& opt) const;
+    // a filled feature replaces the layers that make it
+    int run(const ncnn::VkMat (&frames)[2], float time, ncnn::VkMat& output, ncnn::VkCompute& cmd, const ncnn::Option& opt,
+        const ncnn::VkMat (&features)[2], const bool (&filled)[2]);
 
 private:
     struct Value {
@@ -42,6 +45,9 @@ private:
     // a concat that only a resize reads, its parts are resized into the output of that resize
     std::vector<int> pushed;
     std::vector<float> scale;
+    // layers that depend on one frame alone, and per frame the blob the rest reads and its layer
+    std::vector<int> prefix;
+    int cached[2] = { -1, -1 }, made_by[2] = { -1, -1 };
     std::vector<ncnn::VkMat> constants;
 
     ncnn::Pipeline* pipeline(const char* data, int size, int x, int y, int z);

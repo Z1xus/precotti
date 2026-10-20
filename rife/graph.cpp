@@ -1,5 +1,6 @@
 #include "graph.h"
 
+#include <algorithm>
 #include <string>
 
 #include "layer/binaryop.h"
@@ -300,6 +301,42 @@ bool Graph::load(ncnn::Net& model)
         }
     }
 
+    // layers that depend on one frame give the same blob each time, so make it once
+    std::vector<int> depends(blobs.size(), 0);
+    prefix.assign(layers.size(), 0);
+    for (int index = 0; index < (int)layers.size(); index++) {
+        const ncnn::Layer* layer = layers[index];
+        int mask = 0;
+        for (int bottom : layer->bottoms)
+            mask |= depends[bottom];
+        if (is(layer, "Input"))
+            mask = 1 << (layer->tops[0] == inputs[0] ? 0 : layer->tops[0] == inputs[1] ? 1 : 2);
+        for (int top : layer->tops)
+            depends[top] = mask;
+        if ((mask == 1 || mask == 2) && !is(layer, "Input") && !is(layer, "Split") && !is(layer, "Crop") && !is(layer, "Slice") && !layer->bottoms.empty())
+            prefix[index] = mask;
+    }
+    for (int role = 0; role < 2; role++) {
+        std::vector<int> leaving;
+        for (int index = 0; index < (int)layers.size(); index++) {
+            for (int bottom : layers[index]->bottoms) {
+                const bool leaves = prefix[blobs[bottom].producer] == 1 << role && prefix[index] != 1 << role;
+                if (leaves && std::find(leaving.begin(), leaving.end(), bottom) == leaving.end())
+                    leaving.push_back(bottom);
+            }
+        }
+        const int writer = leaving.size() == 1 ? blobs[leaving[0]].producer : -1;
+        if (writer >= 0 && spread[writer] && !folded[writer] && into[writer] < 0) {
+            cached[role] = leaving[0];
+            made_by[role] = writer;
+        } else {
+            for (int& mask : prefix) {
+                if (mask == 1 << role)
+                    mask = 0;
+            }
+        }
+    }
+
     constants.resize(layers.size());
     ncnn::VkAllocator* staging = gpu->acquire_staging_allocator();
     ncnn::Option opt = model.opt;
@@ -559,7 +596,13 @@ Graph::Value Graph::whole(const Value& value, ncnn::VkCompute& cmd, const ncnn::
     return made;
 }
 
-int Graph::run(const ncnn::VkMat (&frames)[2], float time, ncnn::VkMat& out, ncnn::VkCompute& cmd, const ncnn::Option& opt)
+ncnn::VkMat Graph::feature(int role, int w, int h, const ncnn::Option& opt) const
+{
+    return cached[role] < 0 ? ncnn::VkMat() : tensor(w, h, width[cached[role]], opt);
+}
+
+int Graph::run(const ncnn::VkMat (&frames)[2], float time, ncnn::VkMat& out, ncnn::VkCompute& cmd, const ncnn::Option& opt,
+    const ncnn::VkMat (&features)[2], const bool (&filled)[2])
 {
     const std::vector<ncnn::Layer*>& layers = net->layers();
     std::vector<Value> values(net->blobs().size());
@@ -568,6 +611,10 @@ int Graph::run(const ncnn::VkMat (&frames)[2], float time, ncnn::VkMat& out, ncn
     const auto made = [&](const ncnn::VkMat& mat) { return Value { mat, 0, mat.c * mat.elempack }; };
     // a new tensor, or the part of the concat that the layer feeds
     const auto target = [&](int index, int w, int h, int channels) -> std::pair<ncnn::VkMat, int> {
+        for (int role = 0; role < 2; role++) {
+            if (index == made_by[role] && !features[role].empty() && !filled[role])
+                return { features[role], 0 };
+        }
         int concat = into[index], at = offset[index];
         if (concat < 0)
             return { tensor(w, h, channels, opt), 0 };
@@ -585,9 +632,15 @@ int Graph::run(const ncnn::VkMat (&frames)[2], float time, ncnn::VkMat& out, ncn
     ncnn::VkMat moment = tensor(frames[0].w, frames[0].h, 1, opt);
     apply({ frames[0], 0, 1 }, nullptr, FILL, 1, time, NONE, 0, moment, 0, cmd);
     values[inputs[2]] = made(moment);
+    for (int role = 0; role < 2; role++) {
+        if (!features[role].empty() && filled[role])
+            values[cached[role]] = made(features[role]);
+    }
 
     for (int index = 0; index < (int)layers.size(); index++) {
         const ncnn::Layer* layer = layers[index];
+        if (prefix[index] && !features[prefix[index] - 1].empty() && filled[prefix[index] - 1])
+            continue;
         const std::vector<int>& tops = layer->tops;
         std::vector<Value> bottoms;
         for (int bottom : layer->bottoms)

@@ -88,6 +88,8 @@ struct Held {
     int id = 0;
     ncnn::VkMat mat;
     bool ready = false, failed = false;
+    ncnn::VkMat feature[2];
+    bool featured[2] = {};
 };
 
 struct Rife {
@@ -228,8 +230,8 @@ struct Rife {
         ncnn::VkCompute cmd(gpu);
 
         std::shared_ptr<Held> frames[2];
-        bool fresh[2] = {};
-        ncnn::VkMat mats[2];
+        bool fresh[2] = {}, making[2] = {};
+        ncnn::VkMat mats[2], features[2];
         {
             const std::lock_guard<std::mutex> hold(cache);
             for (int index = 0; index < 2; index++) {
@@ -245,6 +247,13 @@ struct Rife {
                 }
                 held.push_back(frames[index]);
                 mats[index] = frames[index]->mat;
+                if (frames[index]->feature[index].empty()) {
+                    ncnn::Option kind = opt;
+                    kind.blob_vkallocator = kept;
+                    frames[index]->feature[index] = graph.feature(index, wide, high, kind);
+                    making[index] = !frames[index]->feature[index].empty();
+                }
+                features[index] = frames[index]->feature[index];
             }
             if (held.size() > 4)
                 held.erase(held.begin());
@@ -253,13 +262,16 @@ struct Rife {
         const auto finish = [&](bool done) {
             const std::lock_guard<std::mutex> hold(cache);
             for (int index = 0; index < 2; index++) {
-                if (fresh[index]) {
+                if (fresh[index])
                     frames[index]->ready = done;
-                    frames[index]->failed = !done;
-                    if (!done)
-                        held.erase(std::remove(held.begin(), held.end(), frames[index]), held.end());
+                if (making[index])
+                    frames[index]->featured[index] = done;
+                if ((fresh[index] || making[index]) && !done) {
+                    frames[index]->failed = true;
+                    held.erase(std::remove(held.begin(), held.end(), frames[index]), held.end());
                 }
                 mats[index].release();
+                features[index].release();
                 frames[index].reset();
             }
             settled.notify_all();
@@ -292,7 +304,8 @@ struct Rife {
             cmd.record_pipeline(in, { uploaded, mats[index] }, constants, dispatcher);
         }
         ncnn::VkMat result;
-        if (graph.run(mats, time, result, cmd, opt))
+        const bool filled[2] = { !making[0], !making[1] };
+        if (graph.run(mats, time, result, cmd, opt, features, filled))
             return fail();
 
         ncnn::VkMat packed;
@@ -315,16 +328,21 @@ struct Rife {
         cmd.record_clone(packed, downloaded, opt);
         // the nvidia driver lost the gpu with a scheduler error when frames ran on several queues at once
         static std::mutex queue;
-        // a frame that another call converts is ready once that call has run
+        // ready once the call that converts or makes it has run
         std::unique_lock<std::mutex> hold(cache);
         settled.wait(hold, [&] {
             for (int index = 0; index < 2; index++) {
-                if (!fresh[index] && !(index == 1 && frames[1] == frames[0]) && !frames[index]->ready && !frames[index]->failed)
+                const Held& frame = *frames[index];
+                if (frame.failed)
+                    return true;
+                if (!fresh[index] && !(index == 1 && frames[1] == frames[0]) && !frame.ready)
+                    return false;
+                if (!features[index].empty() && !making[index] && !frame.featured[index])
                     return false;
             }
             return true;
         });
-        const bool lost = (!fresh[0] && frames[0]->failed) || (!fresh[1] && frames[1]->failed);
+        const bool lost = frames[0]->failed || frames[1]->failed;
         hold.unlock();
         if (lost)
             return fail();
