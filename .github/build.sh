@@ -6,8 +6,8 @@ target="${1:?target is required}"
 output="${2:-dist}"
 ffmpeg_version=8.1.3
 ffmpeg_source=7138d28c96d9d3e3af4ee3d8cad72741f8ffb40da90c1112235dea3ecd3178a3
-ffmpeg_release=autobuild-2026-10-06-13-06
-ffmpeg_build=ffmpeg-n$ffmpeg_version-14-g330caae0c1
+ffmpeg_release=autobuild-2026-10-20-13-08
+ffmpeg_build=ffmpeg-n$ffmpeg_version-18-g46d899d7a0
 x264_commit=b35605ace3ddf7c1a5d67a2eb553f034aef41d55
 moltenvk_version=v1.4.2
 moltenvk_package=f95765a6229cb7b915990a2890ce12ebe36a730b021545d3d52ae69ce4c4024e
@@ -16,12 +16,12 @@ case "$target" in
   x86_64-unknown-linux-gnu)
     prefix=lib suffix=.so
     archive="$ffmpeg_build-linux64-gpl-shared-8.1.tar.xz"
-    hash=a6d0ea7dfef6ef85d86b8acf1c0a2d5288a05bac42c2cb16914e26830da3d344
+    hash=1550d95f723911d1bd356dabfc1c1b6d26b1e7adaa36a5eda203f8e089d2bbd2
     ;;
   x86_64-pc-windows-msvc)
     prefix='' suffix=.dll
     archive="$ffmpeg_build-win64-gpl-shared-8.1.zip"
-    hash=751c56e0b63426426487ab4048031b0166281c59c0a7e33ef7dd7428495e1d8a
+    hash=36a621ed90a46a2c68af52418be101e8e74327d2784bb35b6cf3874d59b00067
     ;;
   aarch64-apple-darwin | x86_64-apple-darwin)
     prefix=lib suffix=.dylib
