@@ -1,8 +1,10 @@
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <condition_variable>
 #include <cstdlib>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -82,6 +84,12 @@ struct Turn {
     }
 };
 
+struct Held {
+    int id = 0;
+    ncnn::VkMat mat;
+    bool ready = false, failed = false;
+};
+
 struct Rife {
     ncnn::VulkanDevice* gpu = nullptr;
     ncnn::Net flownet;
@@ -97,11 +105,29 @@ struct Rife {
     // 1 when the color planes are half the size of the picture
     int half = 1;
     float color[15] = {};
+    // guards the frames and their allocator
+    std::mutex cache;
+    std::condition_variable settled;
+    std::vector<std::shared_ptr<Held>> held;
+    std::vector<std::vector<uint8_t>> spare;
+    ncnn::VkAllocator* kept = nullptr;
 
     ~Rife()
     {
+        held.clear();
+        delete kept;
         delete in;
         delete out;
+    }
+
+    std::vector<uint8_t> take()
+    {
+        const std::lock_guard<std::mutex> hold(cache);
+        if (spare.empty())
+            return std::vector<uint8_t>(frame);
+        std::vector<uint8_t> bytes = std::move(spare.back());
+        spare.pop_back();
+        return bytes;
     }
 
     ncnn::Pipeline* pipeline(const char* data, int size, int x, int y, int z)
@@ -143,11 +169,17 @@ struct Rife {
             : 32;
         in = pipeline(yuv_in_comp_data, sizeof(yuv_in_comp_data), 8, 8, 1);
         out = pipeline(yuv_out_comp_data, sizeof(yuv_out_comp_data), 64, 1, 1);
+        kept = new ncnn::VkBlobAllocator(gpu);
         return loaded && in && out && graph.load(flownet);
     }
 
     void prepare(int w, int h, bool bt601, bool full, bool yuv444)
     {
+        {
+            const std::lock_guard<std::mutex> hold(cache);
+            held.clear();
+            spare.clear();
+        }
         width = w;
         height = h;
         half = !yuv444;
@@ -183,9 +215,7 @@ struct Rife {
     {
         const int wide = (width + padding - 1) / padding * padding;
         const int high = (height + padding - 1) / padding * padding;
-        std::vector<uint8_t> bytes[3] = { std::vector<uint8_t>(frame), std::vector<uint8_t>(frame), std::vector<uint8_t>(frame) };
-        pack(first, bytes[0].data(), true);
-        pack(second, bytes[1].data(), true);
+        const Picture* pictures[2] = { &first, &second };
 
         const Turn turn(busy, room, working);
         ncnn::VkAllocator* blobs = gpu->acquire_blob_allocator();
@@ -197,13 +227,60 @@ struct Rife {
         const size_t element = opt.use_fp16_storage ? 2u : 4u;
         ncnn::VkCompute cmd(gpu);
 
-        ncnn::VkMat frames[2];
+        std::shared_ptr<Held> frames[2];
+        bool fresh[2] = {};
+        ncnn::VkMat mats[2];
+        {
+            const std::lock_guard<std::mutex> hold(cache);
+            for (int index = 0; index < 2; index++) {
+                const auto found = std::find_if(held.begin(), held.end(), [&](const auto& frame) { return frame->id == pictures[index]->id; });
+                if (found != held.end()) {
+                    frames[index] = *found;
+                    held.erase(found);
+                } else {
+                    frames[index] = std::make_shared<Held>();
+                    frames[index]->id = pictures[index]->id;
+                    frames[index]->mat.create(wide, high, 3, element, 1, kept);
+                    fresh[index] = true;
+                }
+                held.push_back(frames[index]);
+                mats[index] = frames[index]->mat;
+            }
+            if (held.size() > 4)
+                held.erase(held.begin());
+        }
+        // the allocator holds only these frames, so free them under the lock
+        const auto finish = [&](bool done) {
+            const std::lock_guard<std::mutex> hold(cache);
+            for (int index = 0; index < 2; index++) {
+                if (fresh[index]) {
+                    frames[index]->ready = done;
+                    frames[index]->failed = !done;
+                    if (!done)
+                        held.erase(std::remove(held.begin(), held.end(), frames[index]), held.end());
+                }
+                mats[index].release();
+                frames[index].reset();
+            }
+            settled.notify_all();
+        };
+        const auto fail = [&] {
+            finish(false);
+            gpu->reclaim_blob_allocator(blobs);
+            gpu->reclaim_staging_allocator(staging);
+            return 1;
+        };
+
+        std::vector<uint8_t> bytes[3] = { {}, {}, take() };
         for (int index = 0; index < 2; index++) {
+            if (!fresh[index])
+                continue;
+            bytes[index] = take();
+            pack(*pictures[index], bytes[index].data(), true);
             ncnn::VkMat uploaded;
             cmd.record_clone(ncnn::Mat(frame / 4, (void*)bytes[index].data(), (size_t)4u), uploaded, opt);
-            frames[index].create(wide, high, 3, element, 1, blobs);
             std::vector<ncnn::vk_constant_type> constants(15);
-            const int sizes[8] = { width, height, planes[1], planes[2], half, wide, high, (int)frames[index].cstep };
+            const int sizes[8] = { width, height, planes[1], planes[2], half, wide, high, (int)mats[index].cstep };
             for (int i = 0; i < 8; i++)
                 constants[i].i = sizes[i];
             for (int i = 0; i < 7; i++)
@@ -212,14 +289,11 @@ struct Rife {
             dispatcher.w = wide;
             dispatcher.h = high;
             dispatcher.c = 1;
-            cmd.record_pipeline(in, { uploaded, frames[index] }, constants, dispatcher);
+            cmd.record_pipeline(in, { uploaded, mats[index] }, constants, dispatcher);
         }
         ncnn::VkMat result;
-        if (graph.run(frames, time, result, cmd, opt)) {
-            gpu->reclaim_blob_allocator(blobs);
-            gpu->reclaim_staging_allocator(staging);
-            return 1;
-        }
+        if (graph.run(mats, time, result, cmd, opt))
+            return fail();
 
         ncnn::VkMat packed;
         packed.create(frame / 4, (size_t)4u, 1, blobs);
@@ -241,14 +315,33 @@ struct Rife {
         cmd.record_clone(packed, downloaded, opt);
         // the nvidia driver lost the gpu with a scheduler error when frames ran on several queues at once
         static std::mutex queue;
+        // a frame that another call converts is ready once that call has run
+        std::unique_lock<std::mutex> hold(cache);
+        settled.wait(hold, [&] {
+            for (int index = 0; index < 2; index++) {
+                if (!fresh[index] && !(index == 1 && frames[1] == frames[0]) && !frames[index]->ready && !frames[index]->failed)
+                    return false;
+            }
+            return true;
+        });
+        const bool lost = (!fresh[0] && frames[0]->failed) || (!fresh[1] && frames[1]->failed);
+        hold.unlock();
+        if (lost)
+            return fail();
         std::unique_lock<std::mutex> submit(queue);
         const int failed = cmd.submit_and_wait();
         submit.unlock();
+        finish(!failed);
         gpu->reclaim_blob_allocator(blobs);
         gpu->reclaim_staging_allocator(staging);
         if (failed)
             return 1;
         pack(output, bytes[2].data(), false);
+        const std::lock_guard<std::mutex> guard(cache);
+        for (std::vector<uint8_t>& done : bytes) {
+            if (!done.empty())
+                spare.push_back(std::move(done));
+        }
         return 0;
     }
 };
