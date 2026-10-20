@@ -301,6 +301,25 @@ bool Graph::load(ncnn::Net& model)
         }
     }
 
+    // a moved image that only a concat reads is moved and resized in one step
+    lazy.assign(layers.size(), 0);
+    for (int index = 0; index < (int)layers.size(); index++) {
+        if (!is(layers[index], "rife.Warp") || width[layers[index]->tops[0]] > 4)
+            continue;
+        int top = layers[index]->tops[0], reader = blobs[top].consumer;
+        if (readers[top] != 1)
+            continue;
+        const ncnn::Crop* crop = (const ncnn::Crop*)layers[reader];
+        if (is(crop, "Crop") && crop->axes.w == 1 && ((const int*)crop->axes)[0] == 0 && kept(crop, width[top]) == std::pair<int, int> { 0, width[top] }) {
+            top = crop->tops[0];
+            reader = blobs[top].consumer;
+            if (readers[top] != 1)
+                continue;
+        }
+        if (is(layers[reader], "Concat") && pushed[reader] >= 0)
+            lazy[index] = 1;
+    }
+
     // layers that depend on one frame give the same blob each time, so make it once
     std::vector<int> depends(blobs.size(), 0);
     prefix.assign(layers.size(), 0);
@@ -567,6 +586,27 @@ void Graph::resample(const Value& a, int outw, int outh, float k, const ncnn::Vk
     cmd.record_pipeline(interp, { a.mat, result }, constants, dispatcher);
 }
 
+void Graph::move(const Value& image, const Value& flow, int outw, int outh, float k, const ncnn::VkMat& result, int at, ncnn::VkCompute& cmd)
+{
+    const int w = image.mat.w, h = image.mat.h;
+    // the shader moves four channels at most
+    for (int done = 0; done < image.channels; done += 4) {
+        std::vector<ncnn::vk_constant_type> constants(17);
+        const int ints[14] = { w, h, std::min(4, image.channels - done), image.mat.elempack, (int)image.mat.cstep, image.from + done,
+            flow.mat.elempack, (int)flow.mat.cstep, flow.from, result.elempack, (int)result.cstep, at + done, outw, outh };
+        for (int i = 0; i < 14; i++)
+            constants[i].i = ints[i];
+        constants[14].f = (float)w / outw;
+        constants[15].f = (float)h / outh;
+        constants[16].f = k;
+        ncnn::VkMat dispatcher;
+        dispatcher.w = outw;
+        dispatcher.h = outh;
+        dispatcher.c = 1;
+        cmd.record_pipeline(warp, { image.mat, flow.mat, result }, constants, dispatcher);
+    }
+}
+
 void Graph::spread_out(const Value& source, int factor, const ncnn::VkMat& result, int at, ncnn::VkCompute& cmd)
 {
     const int w = source.mat.w, h = source.mat.h, channels = source.channels / factor / factor;
@@ -666,7 +706,7 @@ int Graph::run(const ncnn::VkMat (&frames)[2], float time, ncnn::VkMat& out, ncn
             const ncnn::Crop* crop = (const ncnn::Crop*)layer;
             if (crop->axes.w != 1 || ((const int*)crop->axes)[0] != 0)
                 return 1;
-            values[tops[0]] = { a.mat, a.from + kept(crop, a.channels).first, channels };
+            values[tops[0]] = { a.mat, a.from + kept(crop, a.channels).first, channels, a.flow };
         } else if (is(layer, "Slice")) {
             if (((const ncnn::Slice*)layer)->axis != 0)
                 return 1;
@@ -684,7 +724,10 @@ int Graph::run(const ncnn::VkMat (&frames)[2], float time, ncnn::VkMat& out, ncn
                 const auto [result, from] = target(index, outw, outh, channels);
                 int at = from;
                 for (const Value& part : bottoms) {
-                    resample(part, outw, outh, scale[resize], result, at, cmd);
+                    if (part.flow)
+                        move(part, *part.flow, outw, outh, scale[resize], result, at, cmd);
+                    else
+                        resample(part, outw, outh, scale[resize], result, at, cmd);
                     at += part.channels;
                 }
                 values[tops[0]] = { result, from, channels };
@@ -744,17 +787,12 @@ int Graph::run(const ncnn::VkMat (&frames)[2], float time, ncnn::VkMat& out, ncn
             values[tops[0]] = { result, at, channels };
         } else if (is(layer, "rife.Warp")) {
             const Value& flow = bottoms[1];
+            if (lazy[index]) {
+                values[tops[0]] = { a.mat, a.from, channels, std::make_shared<const Value>(flow) };
+                continue;
+            }
             const auto [result, at] = target(index, w, h, channels);
-            std::vector<ncnn::vk_constant_type> constants(12);
-            const int ints[12] = { w, h, channels, a.mat.elempack, (int)a.mat.cstep, a.from,
-                flow.mat.elempack, (int)flow.mat.cstep, flow.from, result.elempack, (int)result.cstep, at };
-            for (int i = 0; i < 12; i++)
-                constants[i].i = ints[i];
-            ncnn::VkMat dispatcher;
-            dispatcher.w = w;
-            dispatcher.h = h;
-            dispatcher.c = 1;
-            cmd.record_pipeline(warp, { a.mat, flow.mat, result }, constants, dispatcher);
+            move(a, flow, w, h, 1, result, at, cmd);
             values[tops[0]] = { result, at, channels };
         } else if (is(layer, "PixelShuffle")) {
             const ncnn::PixelShuffle* shuffled = (const ncnn::PixelShuffle*)layer;

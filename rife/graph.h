@@ -1,5 +1,6 @@
 #pragma once
 
+#include <memory>
 #include <vector>
 
 #include "command.h"
@@ -23,6 +24,7 @@ private:
         ncnn::VkMat mat;
         int from = 0;
         int channels = 0;
+        std::shared_ptr<const Value> flow;
     };
 
     ncnn::Net* net = nullptr;
@@ -45,6 +47,7 @@ private:
     // a concat that only a resize reads, its parts are resized into the output of that resize
     std::vector<int> pushed;
     std::vector<float> scale;
+    std::vector<int> lazy;
     // layers that depend on one frame alone, and per frame the blob the rest reads and its layer
     std::vector<int> prefix;
     int cached[2] = { -1, -1 }, made_by[2] = { -1, -1 };
@@ -54,6 +57,7 @@ private:
     bool fuse(int index);
     bool unfold(int index);
     ncnn::Layer* make_convolution(const ncnn::Mat& weight, const ncnn::Mat& bias, int outputs, float slope);
+    void move(const Value& image, const Value& flow, int outw, int outh, float k, const ncnn::VkMat& result, int at, ncnn::VkCompute& cmd);
     void spread_out(const Value& source, int factor, const ncnn::VkMat& result, int at, ncnn::VkCompute& cmd);
     ncnn::VkMat tensor(int w, int h, int channels, const ncnn::Option& opt) const;
     Value whole(const Value& value, ncnn::VkCompute& cmd, const ncnn::Option& opt);

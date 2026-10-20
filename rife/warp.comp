@@ -1,4 +1,5 @@
 // moves each pixel of an image by its flow, bilinear and held inside the picture, the coordinates in fp32
+// with a size, also resizes bilinear like interp.comp, skipping the moved image
 
 #version 450
 
@@ -24,6 +25,11 @@ layout (push_constant) uniform parameter
     int out_pack;
     int out_step;
     int out_from;
+    int outw;
+    int outh;
+    float scale_x;
+    float scale_y;
+    float k;
 } p;
 
 // where channel c starts, the pixels of a channel lie pack apart
@@ -32,14 +38,36 @@ int base(int pack, int step, int c)
     return pack == 4 ? (c >> 2) * step * 4 + (c & 3) : c * step;
 }
 
-void main()
+ivec2 pick(int x, float scale, int size, out float f)
 {
-    const int x = int(gl_GlobalInvocationID.x);
-    const int y = int(gl_GlobalInvocationID.y);
+    float s = (float(x) + 0.5) * scale - 0.5;
+    int i = int(floor(s));
+    f = s - float(i);
+    if (i < 0)
+    {
+        i = 0;
+        f = 0.0;
+    }
+    else if (i > size - 2)
+    {
+        i = max(size - 2, 0);
+        f = size > 1 ? 1.0 : 0.0;
+    }
+    return ivec2(i, min(i + 1, size - 1));
+}
 
-    if (x >= p.w || y >= p.h)
-        return;
+// rounds to fp16, the or with zero keeps the compiler from dropping the rounding
+float stored(float v)
+{
+#if NCNN_fp16_storage
+    return unpackHalf2x16(packHalf2x16(vec2(v, 0.0)) | uint(p.channels >> 8)).x;
+#else
+    return v;
+#endif
+}
 
+void move(int x, int y, out float sum[4])
+{
     const int i = y * p.w + x;
     const float sx = float(x) + float(flow_data[base(p.flow_pack, p.flow_step, p.flow_from) + i * p.flow_pack]);
     const float sy = float(y) + float(flow_data[base(p.flow_pack, p.flow_step, p.flow_from + 1) + i * p.flow_pack]);
@@ -52,14 +80,44 @@ void main()
     const float ax = sx - float(left);
     const float ay = sy - float(clamp(y0, 0, p.h - 1));
 
-    for (int c = 0; c < p.channels; c++)
+    for (int c = 0; c < 4; c++)
     {
+        if (c >= p.channels)
+            break;
         const int from = base(p.image_pack, p.image_step, p.image_from + c);
         const float a = float(image_data[from + (top + left) * p.image_pack]);
         const float b = float(image_data[from + (top + right) * p.image_pack]);
         const float d = float(image_data[from + (bottom + left) * p.image_pack]);
         const float e = float(image_data[from + (bottom + right) * p.image_pack]);
-        const float v = (a * (1.0 - ax) + b * ax) * (1.0 - ay) + (d * (1.0 - ax) + e * ax) * ay;
-        out_data[base(p.out_pack, p.out_step, p.out_from + c) + i * p.out_pack] = sfp(v);
+        sum[c] = stored((a * (1.0 - ax) + b * ax) * (1.0 - ay) + (d * (1.0 - ax) + e * ax) * ay);
+    }
+}
+
+void main()
+{
+    const int x = int(gl_GlobalInvocationID.x);
+    const int y = int(gl_GlobalInvocationID.y);
+
+    if (x >= p.outw || y >= p.outh)
+        return;
+
+    float fx;
+    float fy;
+    const ivec2 xs = pick(x, p.scale_x, p.w, fx);
+    const ivec2 ys = pick(y, p.scale_y, p.h, fy);
+    float v[4][4];
+    for (int j = 0; j < 4; j++)
+    {
+        v[j] = float[4](0.0, 0.0, 0.0, 0.0);
+        // a sample with no weight is not moved
+        if (((j & 1) != 0 ? fx : 1.0 - fx) * ((j & 2) != 0 ? fy : 1.0 - fy) != 0.0)
+            move((j & 1) != 0 ? xs.y : xs.x, (j & 2) != 0 ? ys.y : ys.x, v[j]);
+    }
+    const int i = y * p.outw + x;
+    for (int c = 0; c < 4; c++)
+    {
+        if (c >= p.channels)
+            break;
+        out_data[base(p.out_pack, p.out_step, p.out_from + c) + i * p.out_pack] = sfp(mix(mix(v[0][c], v[1][c], fx), mix(v[2][c], v[3][c], fx), fy) * p.k);
     }
 }
