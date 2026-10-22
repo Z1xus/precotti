@@ -1,11 +1,15 @@
 #pragma once
 
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <vector>
 
 #include "command.h"
 #include "net.h"
 #include "pipeline.h"
+
+struct Lost { };
 
 // the flow net of rife with its own steps between the convolutions of ncnn, in one command buffer
 class Graph {
@@ -15,9 +19,9 @@ public:
     static void keep(ncnn::Net& net);
     bool load(ncnn::Net& net);
     ncnn::VkMat feature(int role, int w, int h, const ncnn::Option& opt) const;
-    // a filled feature replaces the layers that make it
+    // a submit ends after this many multiply-adds
     int run(const ncnn::VkMat (&frames)[2], float time, ncnn::VkMat& output, ncnn::VkCompute& cmd, const ncnn::Option& opt,
-        const ncnn::VkMat (&features)[2], const bool (&filled)[2]);
+        const ncnn::VkMat (&features)[2], const bool (&filled)[2], const std::function<int()>& flush, int64_t submit);
 
 private:
     struct Value {

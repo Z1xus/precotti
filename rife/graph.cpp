@@ -86,6 +86,13 @@ bool is(const ncnn::Layer* layer, const char* type)
     return layer->type == type;
 }
 
+int64_t macs(const ncnn::Layer* layer, const ncnn::VkMat& in, const ncnn::VkMat& out)
+{
+    if (is(layer, "Deconvolution"))
+        return (int64_t)in.w * in.h * ((const ncnn::Deconvolution*)layer)->weight_data_size;
+    return (int64_t)out.w * out.h * ((const ncnn::Convolution*)layer)->weight_data_size;
+}
+
 // the channels that a crop keeps, from the first one to the one after the last
 std::pair<int, int> kept(const ncnn::Crop* crop, int channels)
 {
@@ -540,6 +547,8 @@ ncnn::VkMat Graph::tensor(int w, int h, int channels, const ncnn::Option& opt) c
     const int pack = channels % 4 == 0 ? 4 : 1;
     ncnn::VkMat mat;
     mat.create(w, h, channels / pack, (size_t)(pack * (opt.use_fp16_storage ? 2 : 4)), pack, opt.blob_vkallocator);
+    if (mat.empty())
+        throw Lost();
     return mat;
 }
 
@@ -642,12 +651,13 @@ ncnn::VkMat Graph::feature(int role, int w, int h, const ncnn::Option& opt) cons
 }
 
 int Graph::run(const ncnn::VkMat (&frames)[2], float time, ncnn::VkMat& out, ncnn::VkCompute& cmd, const ncnn::Option& opt,
-    const ncnn::VkMat (&features)[2], const bool (&filled)[2])
+    const ncnn::VkMat (&features)[2], const bool (&filled)[2], const std::function<int()>& flush, int64_t submit)
 {
     const std::vector<ncnn::Layer*>& layers = net->layers();
     std::vector<Value> values(net->blobs().size());
     std::vector<int> left = readers;
     std::vector<ncnn::VkMat> joined(layers.size());
+    int64_t work = 0;
     const auto made = [&](const ncnn::VkMat& mat) { return Value { mat, 0, mat.c * mat.elempack }; };
     // a new tensor, or the part of the concat that the layer feeds
     const auto target = [&](int index, int w, int h, int channels) -> std::pair<ncnn::VkMat, int> {
@@ -679,6 +689,11 @@ int Graph::run(const ncnn::VkMat (&frames)[2], float time, ncnn::VkMat& out, ncn
 
     for (int index = 0; index < (int)layers.size(); index++) {
         const ncnn::Layer* layer = layers[index];
+        if (work >= submit) {
+            work = 0;
+            if (flush())
+                return 1;
+        }
         if (prefix[index] && !features[prefix[index] - 1].empty() && filled[prefix[index] - 1])
             continue;
         const std::vector<int>& tops = layer->tops;
@@ -807,6 +822,7 @@ int Graph::run(const ncnn::VkMat (&frames)[2], float time, ncnn::VkMat& out, ncn
                 return 1;
             const int factor = spread[index], last = factor == 4 ? net->blobs()[tops[0]].consumer : index;
             const int result_channels = width[layers[last]->tops[0]];
+            work += macs(replaced[index], a.mat, blocks);
             const auto [result, at] = target(index, w * factor, h * factor, result_channels);
             spread_out(made(blocks), factor, result, at, cmd);
             values[tops[0]] = { result, at, result_channels };
@@ -815,6 +831,7 @@ int Graph::run(const ncnn::VkMat (&frames)[2], float time, ncnn::VkMat& out, ncn
             const ncnn::Layer* run = replaced[index] ? replaced[index] : layer;
             if (run->forward(whole(a, cmd, opt).mat, result, cmd, opt))
                 return 1;
+            work += macs(run, a.mat, result);
             values[tops[0]] = made(result);
         } else {
             return 1;
