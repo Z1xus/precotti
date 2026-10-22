@@ -216,13 +216,14 @@ struct Rife {
                 return nullptr;
         }
         const size_t memory = slot->context->updateDeviceMemorySizeForShapes();
-        if (cuda_malloc(&slot->memory, memory) || cuda_malloc((void**)&slot->device, bytes) || cuda_malloc_host((void**)&slot->host, bytes))
+        if (!cuda_ok(cuda_malloc(&slot->memory, memory)) || !cuda_ok(cuda_malloc((void**)&slot->device, bytes))
+            || !cuda_ok(cuda_malloc_host((void**)&slot->host, bytes)))
             return nullptr;
         slot->context->setDeviceMemoryV2(slot->memory, (int64_t)memory);
         for (int plane = 0; plane < 3; plane++)
             slot->context->setTensorAddress(OUTPUTS[plane], slot->device + 2 * frame + planes[plane]);
         slot->context->setTensorAddress("settings", slot->device + 3 * frame);
-        if (cuda_stream_create(&slot->stream, NON_BLOCKING) || cuda_event_create(&slot->done, BLOCKING_SYNC | DISABLE_TIMING))
+        if (!cuda_ok(cuda_stream_create(&slot->stream, NON_BLOCKING)) || !cuda_ok(cuda_event_create(&slot->done, BLOCKING_SYNC | DISABLE_TIMING)))
             return nullptr;
         return slot;
     }
@@ -286,7 +287,7 @@ struct Rife {
             if (Slot* slot = open())
                 idle.push_back(slot);
             else if (idle.empty()) {
-                fail("not enough gpu memory");
+                fail("tensorrt could not set up the engine");
                 return false;
             }
         }

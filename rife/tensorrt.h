@@ -72,6 +72,7 @@ void* (*create_runtime)(void*, int32_t);
 void* (*create_parser)(void*, void*, int);
 int (*cuda_malloc)(void**, size_t);
 int (*cuda_free)(void*);
+int (*cuda_mem_info)(size_t*, size_t*);
 int (*cuda_malloc_host)(void**, size_t);
 int (*cuda_free_host)(void*);
 int (*cuda_memcpy)(void*, const void*, size_t, int, cudaStream_t);
@@ -167,6 +168,15 @@ void* load(const std::filesystem::path& folder, const char* name)
     return library;
 }
 
+bool cuda_ok(int code)
+{
+    if (code == 0)
+        return true;
+    // cudaErrorMemoryAllocation and cudaErrorInsufficientDriver
+    fail(code == 2 ? "not enough gpu memory" : code == 35 ? "the nvidia driver is too old for cuda 12" : "cuda error " + std::to_string(code));
+    return false;
+}
+
 template <class F>
 bool bind(F& function, void* library, const char* name)
 {
@@ -198,7 +208,7 @@ bool load_libraries()
         return false;
     }
     loaded = bind(create_builder, infer, "createInferBuilder_INTERNAL") && bind(create_runtime, infer, "createInferRuntime_INTERNAL")
-        && bind(create_parser, onnx, "createNvOnnxParser_INTERNAL") && bind(cuda_malloc, cuda, "cudaMalloc") && bind(cuda_free, cuda, "cudaFree")
+        && bind(create_parser, onnx, "createNvOnnxParser_INTERNAL") && bind(cuda_malloc, cuda, "cudaMalloc") && bind(cuda_free, cuda, "cudaFree") && bind(cuda_mem_info, cuda, "cudaMemGetInfo")
         && bind(cuda_malloc_host, cuda, "cudaMallocHost") && bind(cuda_free_host, cuda, "cudaFreeHost") && bind(cuda_memcpy, cuda, "cudaMemcpyAsync")
         && bind(cuda_stream_create, cuda, "cudaStreamCreateWithFlags") && bind(cuda_stream_destroy, cuda, "cudaStreamDestroy")
         && bind(cuda_event_create, cuda, "cudaEventCreateWithFlags") && bind(cuda_event_record, cuda, "cudaEventRecord")
@@ -267,6 +277,9 @@ bool write(const std::filesystem::path& file, const void* data, size_t size)
 std::vector<char> build(const std::filesystem::path& onnx, const std::filesystem::path& name, const Edit& edit, Monitor& monitor)
 {
     std::vector<char> plan;
+    // the workspace defaults to all gpu memory, other programs hold some
+    size_t available = 0, total = 0;
+    const bool known = cuda_ok(cuda_mem_info(&available, &total));
     IBuilder* builder = (IBuilder*)create_builder(&logger, NV_TENSORRT_VERSION);
     if (!builder) {
         fail("tensorrt could not start");
@@ -282,6 +295,8 @@ std::vector<char> build(const std::filesystem::path& onnx, const std::filesystem
         fail("tensorrt could not set up the build");
     } else if (parser->parse(model.data(), model.size()) && edit(*network, *profile)) {
         config->addOptimizationProfile(profile);
+        if (known)
+            config->setMemoryPoolLimit(MemoryPoolType::kWORKSPACE, available);
         config->setFlag(BuilderFlag::kFP16);
         config->setProgressMonitor(&monitor);
         // what the builder learned about the gpu in other builds makes this one shorter
