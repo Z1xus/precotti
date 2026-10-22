@@ -31,18 +31,42 @@ using namespace nvinfer1;
 
 namespace {
 
-// the last error on this thread, for the app to show
-thread_local std::string failure;
+// the first error since the last forget, later ones follow from it
+// tensorrt can tell its errors from any thread
+std::mutex failure_lock;
+std::string failure;
+
+void fail(const std::string& message)
+{
+    const std::lock_guard<std::mutex> guard(failure_lock);
+    if (failure.empty())
+        failure = message;
+}
+
+void forget()
+{
+    const std::lock_guard<std::mutex> guard(failure_lock);
+    failure.clear();
+}
+
+const char* failure_text()
+{
+    thread_local std::string copy;
+    const std::lock_guard<std::mutex> guard(failure_lock);
+    copy = failure;
+    return copy.c_str();
+}
 
 struct Logger : ILogger {
     void log(Severity severity, const char* message) noexcept override
     {
         if (severity <= Severity::kERROR)
-            failure = message;
+            fail(message);
     }
 } logger;
 
 // tensorrt and cuda are loaded at run time, so the build needs the headers only
+int32_t (*library_version)();
 void* (*create_builder)(void*, int32_t);
 void* (*create_runtime)(void*, int32_t);
 void* (*create_parser)(void*, void*, int);
@@ -61,10 +85,14 @@ int (*cuda_event_destroy)(cudaEvent_t);
 const int TO_DEVICE = 1, TO_HOST = 2;
 const unsigned NON_BLOCKING = 1, BLOCKING_SYNC = 1, DISABLE_TIMING = 2;
 
+#define NAME_(text) #text
+#define NAME(text) NAME_(text)
 #if _WIN32
-const wchar_t* const CUDA = L"cudart64_12.dll";
-const wchar_t* const INFER = L"nvinfer_10.dll";
-const wchar_t* const ONNX = L"nvonnxparser_10.dll";
+const char* const CUDA = "cudart64_12.dll";
+const char* const INFER = "nvinfer_" NAME(NV_TENSORRT_MAJOR) ".dll";
+const char* const ONNX = "nvonnxparser_" NAME(NV_TENSORRT_MAJOR) ".dll";
+// tensorrt loads its builder resource by name when it makes an engine, so it must be loaded already
+const char* const RESOURCE = "nvinfer_builder_resource_" NAME(NV_TENSORRT_MAJOR) ".dll";
 
 // the folder of this library
 std::filesystem::path here()
@@ -77,10 +105,20 @@ std::filesystem::path here()
     return std::filesystem::path(name).parent_path();
 }
 
-void* open(const std::filesystem::path& file)
+// the library finds the libraries that it needs in its own folder
+void* open(const std::filesystem::path& file, std::string& why)
 {
-    // the library finds the libraries that it needs in its own folder
-    return LoadLibraryExW(file.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    void* library = LoadLibraryExW(file.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (!library) {
+        const DWORD code = GetLastError();
+        char text[512] = {};
+        FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr, code, MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US), text,
+            sizeof(text), nullptr);
+        why = text;
+        why.erase(why.find_last_not_of(" \r\n") + 1);
+        why = "windows error " + std::to_string(code) + ", " + why;
+    }
+    return library;
 }
 
 void* symbol(void* library, const char* name)
@@ -89,8 +127,8 @@ void* symbol(void* library, const char* name)
 }
 #else
 const char* const CUDA = "libcudart.so.12";
-const char* const INFER = "libnvinfer.so.10";
-const char* const ONNX = "libnvonnxparser.so.10";
+const char* const INFER = "libnvinfer.so." NAME(NV_TENSORRT_MAJOR);
+const char* const ONNX = "libnvonnxparser.so." NAME(NV_TENSORRT_MAJOR);
 
 std::filesystem::path here()
 {
@@ -100,9 +138,12 @@ std::filesystem::path here()
     return std::filesystem::path(info.dli_fname).parent_path();
 }
 
-void* open(const std::filesystem::path& file)
+void* open(const std::filesystem::path& file, std::string& why)
 {
-    return dlopen(file.c_str(), RTLD_NOW | RTLD_GLOBAL);
+    void* library = dlopen(file.c_str(), RTLD_NOW | RTLD_GLOBAL);
+    if (!library)
+        why = dlerror();
+    return library;
 }
 
 void* symbol(void* library, const char* name)
@@ -111,37 +152,57 @@ void* symbol(void* library, const char* name)
 }
 #endif
 
+void* load(const std::filesystem::path& folder, const char* name)
+{
+    const std::filesystem::path file = folder / name;
+    std::error_code error;
+    if (!std::filesystem::exists(file, error)) {
+        fail(std::string(name) + " is not in " + folder.u8string());
+        return nullptr;
+    }
+    std::string why;
+    void* library = open(file, why);
+    if (!library)
+        fail(std::string("cannot load ") + name + ", " + why);
+    return library;
+}
+
+template <class F>
+bool bind(F& function, void* library, const char* name)
+{
+    function = (F)symbol(library, name);
+    if (!function)
+        fail(std::string(name) + " is missing, the libraries are not made for this plugin");
+    return function != nullptr;
+}
+
 bool load_libraries()
 {
-    static const bool loaded = [] {
-        const std::filesystem::path folder = here() / "tensorrt";
-        void* cuda = open(folder / CUDA);
-        void* infer = open(folder / INFER);
-        void* onnx = open(folder / ONNX);
-        if (!cuda || !infer || !onnx)
-            return false;
+    static std::mutex lock;
+    static bool loaded = false;
+    const std::lock_guard<std::mutex> guard(lock);
+    if (loaded)
+        return true;
+    const std::filesystem::path folder = here() / "tensorrt";
+    void* cuda = load(folder, CUDA);
+    void* infer = cuda ? load(folder, INFER) : nullptr;
+    void* onnx = infer ? load(folder, ONNX) : nullptr;
 #if _WIN32
-        // tensorrt loads its builder resource by name when it makes an engine, so it must be loaded already
-        if (!open(folder / L"nvinfer_builder_resource_10.dll"))
-            return false;
+    if (onnx && !load(folder, RESOURCE))
+        return false;
 #endif
-        create_builder = (decltype(create_builder))symbol(infer, "createInferBuilder_INTERNAL");
-        create_runtime = (decltype(create_runtime))symbol(infer, "createInferRuntime_INTERNAL");
-        create_parser = (decltype(create_parser))symbol(onnx, "createNvOnnxParser_INTERNAL");
-        cuda_malloc = (decltype(cuda_malloc))symbol(cuda, "cudaMalloc");
-        cuda_free = (decltype(cuda_free))symbol(cuda, "cudaFree");
-        cuda_malloc_host = (decltype(cuda_malloc_host))symbol(cuda, "cudaMallocHost");
-        cuda_free_host = (decltype(cuda_free_host))symbol(cuda, "cudaFreeHost");
-        cuda_memcpy = (decltype(cuda_memcpy))symbol(cuda, "cudaMemcpyAsync");
-        cuda_stream_create = (decltype(cuda_stream_create))symbol(cuda, "cudaStreamCreateWithFlags");
-        cuda_stream_destroy = (decltype(cuda_stream_destroy))symbol(cuda, "cudaStreamDestroy");
-        cuda_event_create = (decltype(cuda_event_create))symbol(cuda, "cudaEventCreateWithFlags");
-        cuda_event_record = (decltype(cuda_event_record))symbol(cuda, "cudaEventRecord");
-        cuda_event_wait = (decltype(cuda_event_wait))symbol(cuda, "cudaEventSynchronize");
-        cuda_event_destroy = (decltype(cuda_event_destroy))symbol(cuda, "cudaEventDestroy");
-        return create_builder && create_runtime && create_parser && cuda_malloc && cuda_free && cuda_malloc_host && cuda_free_host && cuda_memcpy
-            && cuda_stream_create && cuda_stream_destroy && cuda_event_create && cuda_event_record && cuda_event_wait && cuda_event_destroy;
-    }();
+    if (!onnx || !bind(library_version, infer, "getInferLibVersion"))
+        return false;
+    if (library_version() != NV_TENSORRT_VERSION) {
+        fail(std::string(INFER) + " is version " + std::to_string(library_version()) + ", the plugin needs " + std::to_string(NV_TENSORRT_VERSION));
+        return false;
+    }
+    loaded = bind(create_builder, infer, "createInferBuilder_INTERNAL") && bind(create_runtime, infer, "createInferRuntime_INTERNAL")
+        && bind(create_parser, onnx, "createNvOnnxParser_INTERNAL") && bind(cuda_malloc, cuda, "cudaMalloc") && bind(cuda_free, cuda, "cudaFree")
+        && bind(cuda_malloc_host, cuda, "cudaMallocHost") && bind(cuda_free_host, cuda, "cudaFreeHost") && bind(cuda_memcpy, cuda, "cudaMemcpyAsync")
+        && bind(cuda_stream_create, cuda, "cudaStreamCreateWithFlags") && bind(cuda_stream_destroy, cuda, "cudaStreamDestroy")
+        && bind(cuda_event_create, cuda, "cudaEventCreateWithFlags") && bind(cuda_event_record, cuda, "cudaEventRecord")
+        && bind(cuda_event_wait, cuda, "cudaEventSynchronize") && bind(cuda_event_destroy, cuda, "cudaEventDestroy");
     return loaded;
 }
 
@@ -208,7 +269,7 @@ std::vector<char> build(const std::filesystem::path& onnx, const std::filesystem
     std::vector<char> plan;
     IBuilder* builder = (IBuilder*)create_builder(&logger, NV_TENSORRT_VERSION);
     if (!builder) {
-        failure = "tensorrt could not start";
+        fail("tensorrt could not start");
         return plan;
     }
     INetworkDefinition* network = builder->createNetworkV2(0);
@@ -218,8 +279,7 @@ std::vector<char> build(const std::filesystem::path& onnx, const std::filesystem
     // the parser gets the bytes, it cannot open a path with letters outside of ascii on windows
     const std::vector<char> model = read(onnx);
     if (!network || !parser || !config || !profile) {
-        if (failure.empty())
-            failure = "tensorrt could not set up the build";
+        fail("tensorrt could not set up the build");
     } else if (parser->parse(model.data(), model.size()) && edit(*network, *profile)) {
         config->addOptimizationProfile(profile);
         config->setFlag(BuilderFlag::kFP16);
@@ -232,7 +292,7 @@ std::vector<char> build(const std::filesystem::path& onnx, const std::filesystem
         if (!cache)
             cache = config->createTimingCache(nullptr, 0);
         if (!cache)
-            failure = "tensorrt could not make a timing cache";
+            fail("tensorrt could not make a timing cache");
         else {
             config->setTimingCache(*cache, true);
             if (IHostMemory* memory = builder->buildSerializedNetwork(*network, *config)) {
@@ -273,6 +333,9 @@ ICudaEngine* load_engine(IRuntime* runtime, const std::filesystem::path& onnx, c
         if (!plan.empty())
             engine = runtime->deserializeCudaEngine(plan.data(), plan.size());
     }
+    // a stale engine that did not load is not a later failure
+    if (engine)
+        forget();
     return engine;
 }
 

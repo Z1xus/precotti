@@ -326,7 +326,7 @@ struct Rife {
         }
         ncnn::Mat downloaded(frame / 4, (void*)bytes[2].data(), (size_t)4u);
         cmd.record_clone(packed, downloaded, opt);
-        // the nvidia driver lost the gpu with a scheduler error when frames ran on several queues at once
+        // the nvidia driver loses the gpu when frames run on several queues
         static std::mutex queue;
         // ready once the call that converts or makes it has run
         std::unique_lock<std::mutex> hold(cache);

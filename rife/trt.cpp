@@ -230,7 +230,7 @@ struct Rife {
     // a rife that ran before keeps its engine, and its slots when the size is the same
     bool prepare(int w, int h, bool bt601, bool full, bool yuv444)
     {
-        failure.clear();
+        forget();
         const float kr = bt601 ? 0.299f : 0.2126f, kb = bt601 ? 0.114f : 0.0722f, kg = 1 - kr - kb;
         const float luma = full ? 255 : 219, chroma = full ? 255 : 224;
         const float rv = 2 * (1 - kr), bu = 2 * (1 - kb);
@@ -286,10 +286,11 @@ struct Rife {
             if (Slot* slot = open())
                 idle.push_back(slot);
             else if (idle.empty()) {
-                failure = "not enough gpu memory";
+                fail("not enough gpu memory");
                 return false;
             }
         }
+        forget();
         return true;
     }
 
@@ -384,9 +385,9 @@ auto guard(F body, decltype(body()) error) -> decltype(body())
     try {
         return body();
     } catch (const std::exception& e) {
-        failure = e.what();
+        fail(e.what());
     } catch (...) {
-        failure = "unknown error";
+        fail("unknown error");
     }
     return error;
 }
@@ -395,6 +396,7 @@ EXPORT void* rife_create(const char* models)
 {
     return guard(
         [&]() -> void* {
+            forget();
             if (!load_libraries())
                 return nullptr;
             Rife* rife = new Rife;
@@ -431,5 +433,5 @@ EXPORT void rife_destroy(void* rife)
 
 EXPORT const char* rife_error()
 {
-    return failure.c_str();
+    return failure_text();
 }
