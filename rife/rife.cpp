@@ -494,92 +494,97 @@ struct Rife {
         if (empty)
             return fail(STARVED);
 
-        std::vector<uint8_t> bytes[3] = { {}, {}, take() };
-        for (int index = 0; index < 2; index++) {
-            if (!fresh[index])
-                continue;
-            bytes[index] = take();
-            pack(*pictures[index], bytes[index].data(), true);
-            ncnn::VkMat uploaded;
-            cmd.record_clone(ncnn::Mat(frame / 4, (void*)bytes[index].data(), (size_t)4u), uploaded, opt);
-            if (uploaded.empty())
-                return fail(STARVED);
-            std::vector<ncnn::vk_constant_type> constants(15);
-            const int sizes[8] = { width, height, planes[1], planes[2], half, wide, high, (int)mats[index].cstep };
-            for (int i = 0; i < 8; i++)
-                constants[i].i = sizes[i];
-            for (int i = 0; i < 7; i++)
-                constants[8 + i].f = color[i];
-            ncnn::VkMat dispatcher;
-            dispatcher.w = wide;
-            dispatcher.h = high;
-            dispatcher.c = 1;
-            cmd.record_pipeline(in, { uploaded, mats[index] }, constants, dispatcher);
-        }
-        // ready after its convert or make call, which the first submit waits for
-        bool waited = false, gone = false;
-        const auto settle = [&] {
-            std::unique_lock<std::mutex> hold(cache);
-            settled.wait(hold, [&] {
-                for (int index = 0; index < 2; index++) {
-                    const Held& frame = *frames[index];
-                    if (frame.failed)
-                        return true;
-                    if (!fresh[index] && !(index == 1 && frames[1] == frames[0]) && !frame.ready)
-                        return false;
-                    if (!features[index].empty() && !making[index] && !frame.featured[index])
-                        return false;
-                }
-                return true;
-            });
-            return frames[0]->failed || frames[1]->failed;
-        };
-        const auto submit = [&](bool more) {
-            if (!std::exchange(waited, true) && (gone = settle()))
-                return 1;
-            const std::lock_guard<std::mutex> hold(queue);
-            const int failed = cmd.submit_and_wait();
-            if (failed)
-                dead = true;
-            else if (more)
-                cmd.reset();
-            return failed;
-        };
-        const auto flush = [&] { return submit(true); };
-        ncnn::VkMat result;
-        const bool filled[2] = { !making[0], !making[1] };
+        std::vector<uint8_t> bytes[3];
         try {
-            if (graph.run(mats, time, result, cmd, opt, features, filled, flush, SUBMIT_MACS))
-                return fail(starved() || gone ? STARVED : FAILED);
-        } catch (const Lost&) {
-            return fail(STARVED);
-        }
+            bytes[2] = take();
+            for (int index = 0; index < 2; index++) {
+                if (!fresh[index])
+                    continue;
+                bytes[index] = take();
+                pack(*pictures[index], bytes[index].data(), true);
+                ncnn::VkMat uploaded;
+                cmd.record_clone(ncnn::Mat(frame / 4, (void*)bytes[index].data(), (size_t)4u), uploaded, opt);
+                if (uploaded.empty())
+                    return fail(STARVED);
+                std::vector<ncnn::vk_constant_type> constants(15);
+                const int sizes[8] = { width, height, planes[1], planes[2], half, wide, high, (int)mats[index].cstep };
+                for (int i = 0; i < 8; i++)
+                    constants[i].i = sizes[i];
+                for (int i = 0; i < 7; i++)
+                    constants[8 + i].f = color[i];
+                ncnn::VkMat dispatcher;
+                dispatcher.w = wide;
+                dispatcher.h = high;
+                dispatcher.c = 1;
+                cmd.record_pipeline(in, { uploaded, mats[index] }, constants, dispatcher);
+            }
+            // ready after its convert or make call, which the first submit waits for
+            bool waited = false, gone = false;
+            const auto settle = [&] {
+                std::unique_lock<std::mutex> hold(cache);
+                settled.wait(hold, [&] {
+                    for (int index = 0; index < 2; index++) {
+                        const Held& frame = *frames[index];
+                        if (frame.failed)
+                            return true;
+                        if (!fresh[index] && !(index == 1 && frames[1] == frames[0]) && !frame.ready)
+                            return false;
+                        if (!features[index].empty() && !making[index] && !frame.featured[index])
+                            return false;
+                    }
+                    return true;
+                });
+                return frames[0]->failed || frames[1]->failed;
+            };
+            const auto submit = [&](bool more) {
+                if (!std::exchange(waited, true) && (gone = settle()))
+                    return 1;
+                const std::lock_guard<std::mutex> hold(queue);
+                const int failed = cmd.submit_and_wait();
+                if (failed)
+                    dead = true;
+                else if (more)
+                    cmd.reset();
+                return failed;
+            };
+            const auto flush = [&] { return submit(true); };
+            ncnn::VkMat result;
+            const bool filled[2] = { !making[0], !making[1] };
+            try {
+                if (graph.run(mats, time, result, cmd, opt, features, filled, flush, SUBMIT_MACS))
+                    return fail(starved() || gone ? STARVED : FAILED);
+            } catch (const Lost&) {
+                return fail(STARVED);
+            }
 
-        ncnn::VkMat packed;
-        packed.create(frame / 4, (size_t)4u, 1, &slot.blobs);
-        if (packed.empty())
-            return fail(STARVED);
-        for (int chroma = 0; chroma < 2; chroma++) {
-            std::vector<ncnn::vk_constant_type> constants(16);
-            const int sizes[8] = { width, height, (int)result.cstep, result.w, chroma, planes[1], planes[2], half };
-            for (int i = 0; i < 8; i++)
-                constants[i].i = sizes[i];
-            constants[8].f = color[0];
-            for (int i = 0; i < 7; i++)
-                constants[9 + i].f = color[7 + i];
-            ncnn::VkMat dispatcher;
-            dispatcher.w = chroma ? ((width >> half) * (height >> half) + 3) / 4 : (width * height + 3) / 4;
-            dispatcher.h = 1;
-            dispatcher.c = 1;
-            cmd.record_pipeline(out, { result, packed }, constants, dispatcher);
+            ncnn::VkMat packed;
+            packed.create(frame / 4, (size_t)4u, 1, &slot.blobs);
+            if (packed.empty())
+                return fail(STARVED);
+            for (int chroma = 0; chroma < 2; chroma++) {
+                std::vector<ncnn::vk_constant_type> constants(16);
+                const int sizes[8] = { width, height, (int)result.cstep, result.w, chroma, planes[1], planes[2], half };
+                for (int i = 0; i < 8; i++)
+                    constants[i].i = sizes[i];
+                constants[8].f = color[0];
+                for (int i = 0; i < 7; i++)
+                    constants[9 + i].f = color[7 + i];
+                ncnn::VkMat dispatcher;
+                dispatcher.w = chroma ? ((width >> half) * (height >> half) + 3) / 4 : (width * height + 3) / 4;
+                dispatcher.h = 1;
+                dispatcher.c = 1;
+                cmd.record_pipeline(out, { result, packed }, constants, dispatcher);
+            }
+            ncnn::Mat downloaded(frame / 4, (void*)bytes[2].data(), (size_t)4u);
+            cmd.record_clone(packed, downloaded, opt);
+            if (starved())
+                return fail(STARVED);
+            const int failed = submit(false);
+            if (failed)
+                return fail(gone ? STARVED : FAILED);
+        } catch (const std::bad_alloc&) {
+            return fail(FAILED);
         }
-        ncnn::Mat downloaded(frame / 4, (void*)bytes[2].data(), (size_t)4u);
-        cmd.record_clone(packed, downloaded, opt);
-        if (starved())
-            return fail(STARVED);
-        const int failed = submit(false);
-        if (failed)
-            return fail(gone ? STARVED : FAILED);
         finish(true);
         pack(output, bytes[2].data(), false);
         const std::lock_guard<std::mutex> guard(cache);
@@ -615,27 +620,41 @@ extern "C" void rife_log(const char* format, ...)
     logged = line;
 }
 
+// an exception must not leave the library, the app gets the error
+template <class F>
+auto guard(F body, decltype(body()) error) -> decltype(body())
+{
+    try {
+        return body();
+    } catch (const std::bad_alloc&) {
+        failure = "not enough memory";
+    }
+    return error;
+}
+
 EXPORT void* rife_create(const char* models)
 {
-    failure.clear();
-    ncnn::create_gpu_instance();
-    if (ncnn::get_gpu_count() == 0) {
-        failure = "rife needs a vulkan gpu";
-        return nullptr;
-    }
-    logged.clear();
-    // exit handlers run in reverse, so this one runs before the one of ncnn
-    static const int registered = atexit(release);
-    (void)registered;
-    Rife* rife = new Rife;
-    if (!rife->load(models)) {
-        delete rife;
-        failure = "rife could not load its model on the gpu";
-        return nullptr;
-    }
-    const std::lock_guard<std::mutex> guard(lock);
-    alive.insert(rife);
-    return rife;
+    return guard([&]() -> void* {
+        failure.clear();
+        ncnn::create_gpu_instance();
+        if (ncnn::get_gpu_count() == 0) {
+            failure = "rife needs a vulkan gpu";
+            return nullptr;
+        }
+        logged.clear();
+        // exit handlers run in reverse, so this one runs before the one of ncnn
+        static const int registered = atexit(release);
+        (void)registered;
+        Rife* rife = new Rife;
+        if (!rife->load(models)) {
+            delete rife;
+            failure = "rife could not load its model on the gpu";
+            return nullptr;
+        }
+        const std::lock_guard<std::mutex> hold(lock);
+        alive.insert(rife);
+        return rife;
+    }, nullptr);
 }
 
 // the app calls it before exit, so no gpu call runs at unload
@@ -648,13 +667,15 @@ EXPORT void rife_shutdown()
 // ncnn has nothing to build
 EXPORT int rife_prepare(void* rife, int width, int height, int bt601, int full, int yuv444, void (*)(void*, float), void*)
 {
-    ((Rife*)rife)->prepare(width, height, bt601, full, yuv444);
-    return 0;
+    return guard([&] {
+        ((Rife*)rife)->prepare(width, height, bt601, full, yuv444);
+        return 0;
+    }, 1);
 }
 
 EXPORT int rife_process(void* rife, const Picture* first, const Picture* second, float time, const Picture* output)
 {
-    return ((Rife*)rife)->process(*first, *second, time, *output);
+    return guard([&] { return ((Rife*)rife)->process(*first, *second, time, *output); }, 1);
 }
 
 EXPORT void rife_destroy(void* rife)
