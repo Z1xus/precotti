@@ -5,6 +5,7 @@
 #include <cstring>
 #include <utility>
 #include <condition_variable>
+#include <cstdarg>
 #include <cstdlib>
 #include <memory>
 #include <mutex>
@@ -109,6 +110,8 @@ constexpr int64_t SUBMIT_MACS = 4LL << 30;
 thread_local std::string failure;
 // the nvidia driver loses the gpu when frames run on several queues, also from two rifes
 std::mutex queue;
+// the last ncnn log line tells why a call failed
+thread_local std::string logged;
 
 // nvenc and the motion search use cuda device 0
 bool cuda_uuid(uint8_t (&uuid)[16])
@@ -337,6 +340,7 @@ struct Rife {
         }
         flownet.register_custom_layer("rife.Warp", make_warp);
         Graph::keep(flownet);
+        logged.clear();
         FILE* param = open((folder + "/flownet.param").c_str());
         FILE* model = open((folder + "/flownet.bin").c_str());
         const bool loaded = param && model && flownet.load_param(param) == 0 && flownet.load_model(model) == 0;
@@ -396,6 +400,7 @@ struct Rife {
     int process(const Picture& first, const Picture& second, float time, const Picture& output)
     {
         failure.clear();
+        logged.clear();
         if (dead) {
             failure = "the gpu stopped responding";
             return 1;
@@ -600,6 +605,16 @@ void release()
 
 }
 
+extern "C" void rife_log(const char* format, ...)
+{
+    char line[512];
+    va_list arguments;
+    va_start(arguments, format);
+    vsnprintf(line, sizeof line, format, arguments);
+    va_end(arguments);
+    logged = line;
+}
+
 EXPORT void* rife_create(const char* models)
 {
     failure.clear();
@@ -608,6 +623,7 @@ EXPORT void* rife_create(const char* models)
         failure = "rife needs a vulkan gpu";
         return nullptr;
     }
+    logged.clear();
     // exit handlers run in reverse, so this one runs before the one of ncnn
     static const int registered = atexit(release);
     (void)registered;
@@ -650,5 +666,7 @@ EXPORT void rife_destroy(void* rife)
 
 EXPORT const char* rife_error()
 {
-    return failure.c_str();
+    static thread_local std::string text;
+    text = logged.empty() || failure.empty() ? failure : failure + ": " + logged;
+    return text.c_str();
 }

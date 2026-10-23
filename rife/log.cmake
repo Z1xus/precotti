@@ -1,0 +1,10 @@
+file(READ ${file} text)
+if(text MATCHES "rife_log")
+    return()
+endif()
+string(REPLACE "#include <stdio.h>\n#define NCNN_LOGE(...) do { \\\n    fprintf(stderr, ##__VA_ARGS__); fprintf(stderr, \"\\n\"); } while(0)"
+    "#include <stdio.h>\n#ifdef __cplusplus\nextern \"C\"\n#endif\nvoid rife_log(const char* format, ...);\n#define NCNN_LOGE(...) rife_log(__VA_ARGS__)" patched "${text}")
+if(patched STREQUAL text)
+    message(FATAL_ERROR "ncnn log macro not found")
+endif()
+file(WRITE ${file} "${patched}")

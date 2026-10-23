@@ -28,7 +28,8 @@ set(NCNN_PIXEL_DRAWING OFF CACHE BOOL "")
 FetchContent_Declare(ncnn
     GIT_REPOSITORY https://github.com/Tencent/ncnn.git
     GIT_TAG e54f7b1f88434e1d844ea0551b880a1cfb079ce1
-    GIT_SUBMODULES glslang)
+    GIT_SUBMODULES glslang
+    PATCH_COMMAND ${CMAKE_COMMAND} -Dfile=src/platform.h.in -P ${CMAKE_CURRENT_SOURCE_DIR}/log.cmake)
 FetchContent_MakeAvailable(ncnn)
 
 # the models come from this fork of rife-ncnn-vulkan
