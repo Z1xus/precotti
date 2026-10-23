@@ -364,7 +364,8 @@ struct Rife {
         width = w;
         height = h;
         half = !yuv444;
-        const auto word = [](int bytes) { return (bytes + 3) / 4 * 4; };
+        // ncnn copies a mat in blocks of 16 bytes
+        const auto word = [](int bytes) { return (bytes + 15) / 16 * 16; };
         const int area = (w >> half) * (h >> half);
         planes[1] = word(w * h);
         planes[2] = planes[1] + word(area);
