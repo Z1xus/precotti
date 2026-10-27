@@ -3,6 +3,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <stdexcept>
 
 #include "tensorrt.h"
 
@@ -23,10 +24,18 @@ struct Wrap {
     std::deque<float> floats;
     std::deque<int64_t> ints;
 
+    // tensorrt gives no layer when it fails, and tells why to the logger first
+    template <class Layer> Layer* made(Layer* layer)
+    {
+        if (!layer)
+            throw std::runtime_error("tensorrt could not change the model");
+        return layer;
+    }
+
     ITensor* constant(float value)
     {
         floats.push_back(value);
-        return network->addConstant(Dims4(1, 1, 1, 1), Weights { DataType::kFLOAT, &floats.back(), 1 })->getOutput(0);
+        return made(network->addConstant(Dims4(1, 1, 1, 1), Weights { DataType::kFLOAT, &floats.back(), 1 }))->getOutput(0);
     }
 
     ITensor* shape(const std::vector<int64_t>& values)
@@ -36,12 +45,12 @@ struct Wrap {
         Dims dims;
         dims.nbDims = 1;
         dims.d[0] = (int64_t)values.size();
-        return network->addConstant(dims, Weights { DataType::kINT64, &ints[at], (int64_t)values.size() })->getOutput(0);
+        return made(network->addConstant(dims, Weights { DataType::kINT64, &ints[at], (int64_t)values.size() }))->getOutput(0);
     }
 
     ITensor* math(ITensor* a, ITensor* b, ElementWiseOperation op)
     {
-        return network->addElementWise(*a, *b, op)->getOutput(0);
+        return made(network->addElementWise(*a, *b, op))->getOutput(0);
     }
 
     ITensor* sum(ITensor* a, ITensor* b) { return math(a, b, ElementWiseOperation::kSUM); }
@@ -49,7 +58,7 @@ struct Wrap {
 
     ITensor* clip(ITensor* tensor, float low, float high)
     {
-        IActivationLayer* layer = network->addActivation(*tensor, ActivationType::kCLIP);
+        IActivationLayer* layer = made(network->addActivation(*tensor, ActivationType::kCLIP));
         layer->setAlpha(low);
         layer->setBeta(high);
         return layer->getOutput(0);
@@ -57,7 +66,7 @@ struct Wrap {
 
     ITensor* cut(ITensor* tensor, Dims4 start, ITensor* size, SampleMode mode = SampleMode::kSTRICT_BOUNDS)
     {
-        ISliceLayer* layer = network->addSlice(*tensor, start, Dims4(1, 1, 1, 1), Dims4(1, 1, 1, 1));
+        ISliceLayer* layer = made(network->addSlice(*tensor, start, Dims4(1, 1, 1, 1), Dims4(1, 1, 1, 1)));
         layer->setInput(2, *size);
         layer->setMode(mode);
         return layer->getOutput(0);
@@ -65,13 +74,13 @@ struct Wrap {
 
     ITensor* value(ITensor* values, int index)
     {
-        return network->addSlice(*values, Dims4(0, index, 0, 0), Dims4(1, 1, 1, 1), Dims4(1, 1, 1, 1))->getOutput(0);
+        return made(network->addSlice(*values, Dims4(0, index, 0, 0), Dims4(1, 1, 1, 1), Dims4(1, 1, 1, 1)))->getOutput(0);
     }
 
     ITensor* bytes(ITensor* tensor, const char* name)
     {
         ITensor* rounded = clip(sum(tensor, constant(0.5f)), 0, 255);
-        ITensor* output = network->addCast(*rounded, DataType::kUINT8)->getOutput(0);
+        ITensor* output = made(network->addCast(*rounded, DataType::kUINT8))->getOutput(0);
         output->setName(name);
         network->markOutput(*output);
         return output;
@@ -80,8 +89,8 @@ struct Wrap {
     // resizes to the size of another tensor, the color planes of 4:2:0 and 4:4:4 take the same engine
     ITensor* resize(ITensor* tensor, ITensor* like)
     {
-        IResizeLayer* layer = network->addResize(*tensor);
-        layer->setInput(1, *network->addShape(*like)->getOutput(0));
+        IResizeLayer* layer = made(network->addResize(*tensor));
+        layer->setInput(1, *made(network->addShape(*like))->getOutput(0));
         layer->setResizeMode(InterpolationMode::kLINEAR);
         layer->setCoordinateTransformation(ResizeCoordinateTransformation::kHALF_PIXEL);
         return layer->getOutput(0);
@@ -89,6 +98,17 @@ struct Wrap {
 
     // half is 1 when the color planes are half the size of the picture, as in 4:2:0
     bool operator()(INetworkDefinition& net, IOptimizationProfile& profile, int width, int height, int half, int side)
+    {
+        try {
+            edit(net, profile, width, height, half, side);
+            return true;
+        } catch (const std::runtime_error& error) {
+            fail(error.what());
+            return false;
+        }
+    }
+
+    void edit(INetworkDefinition& net, IOptimizationProfile& profile, int width, int height, int half, int side)
     {
         network = &net;
         // removeTensor on an input fails in tensorrt 10.9, so the input is reused
@@ -112,11 +132,11 @@ struct Wrap {
             ITensor* planes[3];
             for (int plane = 0; plane < 3; plane++) {
                 const int shift = plane > 0 ? half : 0;
-                ITensor* input = net.addInput(INPUTS[frame * 3 + plane], DataType::kUINT8, Dims4(1, 1, -1, -1));
+                ITensor* input = made(net.addInput(INPUTS[frame * 3 + plane], DataType::kUINT8, Dims4(1, 1, -1, -1)));
                 profile.setDimensions(input->getName(), OptProfileSelector::kMIN, Dims4(1, 1, 1, 1));
                 profile.setDimensions(input->getName(), OptProfileSelector::kOPT, Dims4(1, 1, height >> shift, width >> shift));
                 profile.setDimensions(input->getName(), OptProfileSelector::kMAX, Dims4(1, 1, side, side));
-                planes[plane] = net.addCast(*input, DataType::kFLOAT)->getOutput(0);
+                planes[plane] = made(net.addCast(*input, DataType::kFLOAT))->getOutput(0);
                 if (plane > 0) {
                     color = color ? color : input;
                     planes[plane] = product(sum(resize(planes[plane], planes[0]), constant(-128)), at(CHROMA_SCALE));
@@ -127,16 +147,16 @@ struct Wrap {
             ITensor* g = math(math(y, product(at(G_U), planes[1]), ElementWiseOperation::kSUB), product(at(G_V), planes[2]), ElementWiseOperation::kSUB);
             ITensor* b = sum(y, product(at(B_U), planes[1]));
             ITensor* channels[3] = { clip(r, 0, 1), clip(g, 0, 1), clip(b, 0, 1) };
-            rgb[frame] = net.addConcatenation(channels, 3)->getOutput(0);
+            rgb[frame] = made(net.addConcatenation(channels, 3))->getOutput(0);
         }
 
         // the model takes sizes in steps of 64
-        ITensor* size = net.addShape(*rgb[0])->getOutput(0);
+        ITensor* size = made(net.addShape(*rgb[0]))->getOutput(0);
         ITensor* padded = product(math(sum(size, shape({ 0, 0, 63, 63 })), shape({ 1, 1, 64, 64 }), ElementWiseOperation::kFLOOR_DIV), shape({ 1, 1, 64, 64 }));
         ITensor* plane = sum(product(padded, shape({ 1, 0, 1, 1 })), shape({ 0, 1, 0, 0 }));
         ITensor* inputs[3] = { cut(rgb[0], Dims4(0, 0, 0, 0), padded, SampleMode::kCLAMP), cut(rgb[1], Dims4(0, 0, 0, 0), padded, SampleMode::kCLAMP),
             cut(values, Dims4(0, TIME, 0, 0), plane, SampleMode::kCLAMP) };
-        ITensor* joined = net.addConcatenation(inputs, 3)->getOutput(0);
+        ITensor* joined = made(net.addConcatenation(inputs, 3))->getOutput(0);
         for (auto [layer, input] : readers)
             layer->setInput(input, *joined);
 
@@ -152,7 +172,6 @@ struct Wrap {
         // at half the size the bilinear samples at half pixels are the mean of each 2x2 block
         for (int plane = 0; plane < 2; plane++)
             bytes(sum(product(resize(chroma[plane], color), at(CHROMA_RANGE)), constant(128)), OUTPUTS[plane + 1]);
-        return true;
     }
 };
 
