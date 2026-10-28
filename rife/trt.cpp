@@ -22,7 +22,8 @@ enum { TIME, LUMA, LUMA_SCALE, CHROMA_SCALE, R_V, G_U, G_V, B_U, K_R, K_G, K_B, 
 struct Wrap {
     INetworkDefinition* network = nullptr;
     std::deque<float> floats;
-    std::deque<int64_t> ints;
+    // tensorrt reads each shape as one block until the build, and a deque keeps its elements where they are
+    std::deque<std::vector<int64_t>> shapes;
 
     // tensorrt gives no layer when it fails, and tells why to the logger first
     template <class Layer> Layer* made(Layer* layer)
@@ -40,12 +41,11 @@ struct Wrap {
 
     ITensor* shape(const std::vector<int64_t>& values)
     {
-        const size_t at = ints.size();
-        ints.insert(ints.end(), values.begin(), values.end());
+        shapes.push_back(values);
         Dims dims;
         dims.nbDims = 1;
         dims.d[0] = (int64_t)values.size();
-        return made(network->addConstant(dims, Weights { DataType::kINT64, &ints[at], (int64_t)values.size() }))->getOutput(0);
+        return made(network->addConstant(dims, Weights { DataType::kINT64, shapes.back().data(), (int64_t)values.size() }))->getOutput(0);
     }
 
     ITensor* math(ITensor* a, ITensor* b, ElementWiseOperation op)
