@@ -186,6 +186,9 @@ struct Slot {
 
     ~Slot()
     {
+        // the gpu may still use the buffers of a frame that failed
+        if (stream)
+            cuda_stream_wait(stream);
         delete context;
         if (memory)
             cuda_free(memory);
@@ -291,6 +294,7 @@ struct Rife {
         };
         if (!engine || !fits(*engine)) {
             delete engine;
+            engine = nullptr;
             engine = load_engine(runtime, folder / "rife.onnx", folder / "rife.engine", edit, fits, monitor);
         }
         if (!engine)
@@ -379,10 +383,8 @@ struct Rife {
             && !cuda_memcpy(result, slot->device + 2 * frame, frame, TO_HOST, slot->stream)
             && !cuda_event_record(slot->done, slot->stream)
             && !cuda_event_wait(slot->done);
-        if (!done) {
-            slot->held[0] = slot->held[1] = -1;
+        if (!done)
             return false;
-        }
         pack(output, result, false);
         return true;
     }
@@ -391,6 +393,11 @@ struct Rife {
     {
         Slot* slot = take();
         const bool done = run(slot, first, second, time, output);
+        if (!done) {
+            // the copies and the inference before the failure still run, the next frame would write under them
+            cuda_stream_wait(slot->stream);
+            slot->held[0] = slot->held[1] = -1;
+        }
         give(slot);
         return done ? 0 : 1;
     }

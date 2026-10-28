@@ -36,12 +36,18 @@ namespace {
 std::mutex failure_lock;
 std::string failure;
 
-void fail(const std::string& message)
+// tensorrt and the guard report from noexcept code, where a failed allocation would end the app
+void fail(const char* message) noexcept
 {
-    const std::lock_guard<std::mutex> guard(failure_lock);
-    if (failure.empty())
-        failure = message;
+    try {
+        const std::lock_guard<std::mutex> guard(failure_lock);
+        if (failure.empty())
+            failure = message;
+    } catch (...) {
+    }
 }
+
+void fail(const std::string& message) { fail(message.c_str()); }
 
 void forget()
 {
@@ -78,6 +84,7 @@ int (*cuda_free_host)(void*);
 int (*cuda_memcpy)(void*, const void*, size_t, int, cudaStream_t);
 int (*cuda_stream_create)(cudaStream_t*, unsigned);
 int (*cuda_stream_destroy)(cudaStream_t);
+int (*cuda_stream_wait)(cudaStream_t);
 int (*cuda_event_create)(cudaEvent_t*, unsigned);
 int (*cuda_event_record)(cudaEvent_t, cudaStream_t);
 int (*cuda_event_wait)(cudaEvent_t);
@@ -211,6 +218,7 @@ bool load_libraries()
         && bind(create_parser, onnx, "createNvOnnxParser_INTERNAL") && bind(cuda_malloc, cuda, "cudaMalloc") && bind(cuda_free, cuda, "cudaFree") && bind(cuda_mem_info, cuda, "cudaMemGetInfo")
         && bind(cuda_malloc_host, cuda, "cudaMallocHost") && bind(cuda_free_host, cuda, "cudaFreeHost") && bind(cuda_memcpy, cuda, "cudaMemcpyAsync")
         && bind(cuda_stream_create, cuda, "cudaStreamCreateWithFlags") && bind(cuda_stream_destroy, cuda, "cudaStreamDestroy")
+        && bind(cuda_stream_wait, cuda, "cudaStreamSynchronize")
         && bind(cuda_event_create, cuda, "cudaEventCreateWithFlags") && bind(cuda_event_record, cuda, "cudaEventRecord")
         && bind(cuda_event_wait, cuda, "cudaEventSynchronize") && bind(cuda_event_destroy, cuda, "cudaEventDestroy");
     return loaded;
