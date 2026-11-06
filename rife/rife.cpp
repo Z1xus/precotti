@@ -1,16 +1,16 @@
 #include <algorithm>
 #include <atomic>
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
-#include <utility>
 #include <condition_variable>
 #include <cstdarg>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "command.h"
@@ -31,36 +31,11 @@
 
 namespace {
 
-// the graph runs the warps, ncnn only needs to know the layer
-struct Warp : ncnn::Layer {
-    Warp()
-    {
-        one_blob_only = false;
-        support_vulkan = true;
-    }
-};
-
-ncnn::Layer* make_warp(void*)
-{
-    return new Warp;
-}
-
 struct Picture {
     uint8_t* data[3];
     ptrdiff_t stride[3];
     int id;
 };
-
-FILE* open(const char* path)
-{
-#if _WIN32
-    std::wstring wide(MultiByteToWideChar(CP_UTF8, 0, path, -1, nullptr, 0), 0);
-    MultiByteToWideChar(CP_UTF8, 0, path, -1, wide.data(), (int)wide.size());
-    return _wfopen(wide.c_str(), L"rb");
-#else
-    return fopen(path, "rb");
-#endif
-}
 
 template <class Base>
 struct Watched : Base {
@@ -163,15 +138,14 @@ int pick()
 
 struct Held {
     int id = 0;
+    // the picture of the frame, and after it the features
     ncnn::VkMat mat;
     bool ready = false, failed = false;
-    ncnn::VkMat feature[2];
-    bool featured[2] = {};
 };
 
 struct Rife {
     ncnn::VulkanDevice* gpu = nullptr;
-    ncnn::Net flownet;
+    ncnn::Option opt;
     Graph graph;
     // two frames keep the gpu busy, one runs alone after the gpu ran out of memory
     std::mutex busy;
@@ -309,7 +283,7 @@ struct Rife {
     ncnn::Pipeline* pipeline(const char* data, int size, int x, int y, int z)
     {
         std::vector<uint32_t> spirv;
-        if (ncnn::compile_spirv_module(data, size, flownet.opt, spirv))
+        if (ncnn::compile_spirv_module(data, size, opt, spirv))
             return nullptr;
         ncnn::Pipeline* pipeline = new ncnn::Pipeline(gpu);
         pipeline->set_optimal_local_size_xyz(x, y, z);
@@ -320,7 +294,6 @@ struct Rife {
     bool load(const std::string& folder)
     {
         gpu = ncnn::get_gpu_device(pick());
-        ncnn::Option& opt = flownet.opt;
         opt.use_vulkan_compute = true;
         // the shaders of the graph read halves only from fp16 storage
         opt.use_fp16_storage = opt.use_fp16_packed = gpu->info.support_fp16_storage();
@@ -329,7 +302,14 @@ struct Rife {
         opt.use_int8_storage = false;
         // the gemm kernels on cooperative matrices beat winograd
         opt.use_winograd_convolution = !gpu->info.support_cooperative_matrix();
-        flownet.set_vulkan_device(gpu);
+        // what ncnn does to the options of a net
+        opt.use_fp16_packed = opt.use_fp16_packed && gpu->info.support_fp16_packed();
+        opt.use_fp16_uniform = opt.use_fp16_uniform && gpu->info.support_fp16_uniform();
+        opt.use_fp16_arithmetic = opt.use_fp16_arithmetic && gpu->info.support_fp16_arithmetic() && (opt.use_fp16_packed || opt.use_fp16_storage);
+        opt.use_fp16_uniform = opt.use_fp16_uniform && opt.use_fp16_arithmetic;
+        opt.use_cooperative_matrix = opt.use_cooperative_matrix && gpu->info.support_cooperative_matrix();
+        opt.use_subgroup_ops = opt.use_subgroup_ops && gpu->info.support_subgroup_ops();
+        opt.use_shader_local_memory = opt.use_shader_local_memory && gpu->info.type() == 0;
         const VkPhysicalDeviceMemoryProperties& memory = gpu->info.physicalDeviceMemoryProperties();
         VkDeviceSize largest = 0;
         for (uint32_t index = 0; index < memory.memoryHeapCount; index++) {
@@ -338,16 +318,7 @@ struct Rife {
                 heap = index;
             }
         }
-        flownet.register_custom_layer("rife.Warp", make_warp);
-        Graph::keep(flownet);
         logged.clear();
-        FILE* param = open((folder + "/flownet.param").c_str());
-        FILE* model = open((folder + "/flownet.bin").c_str());
-        const bool loaded = param && model && flownet.load_param(param) == 0 && flownet.load_model(model) == 0;
-        if (param)
-            fclose(param);
-        if (model)
-            fclose(model);
         // the newer models take the picture in larger steps of size
         padding = folder.find("rife-v4.25-lite") != std::string::npos ? 128
             : folder.find("rife-v4.25") != std::string::npos || folder.find("rife-v4.26") != std::string::npos ? 64
@@ -355,7 +326,15 @@ struct Rife {
         in = pipeline(yuv_in_comp_data, sizeof(yuv_in_comp_data), 8, 8, 1);
         out = pipeline(yuv_out_comp_data, sizeof(yuv_out_comp_data), 64, 1, 1);
         kept = new ncnn::VkBlobAllocator(gpu);
-        return loaded && in && out && graph.load(flownet);
+        if (!in || !out)
+            return false;
+        try {
+            graph.load(std::filesystem::u8path(folder), gpu, opt);
+        } catch (const std::runtime_error& error) {
+            failure = error.what();
+            return false;
+        }
+        return true;
     }
 
     void prepare(int w, int h, bool bt601, bool full, bool yuv444)
@@ -368,6 +347,11 @@ struct Rife {
         width = w;
         height = h;
         half = !yuv444;
+        {
+            // lowering uploads weights and tables
+            const std::lock_guard<std::mutex> hold(queue);
+            graph.lower((w + padding - 1) / padding * padding, (h + padding - 1) / padding * padding);
+        }
         // ncnn copies a mat in blocks of 16 bytes
         const auto word = [](int bytes) { return (bytes + 15) / 16 * 16; };
         const int area = (w >> half) * (h >> half);
@@ -429,16 +413,18 @@ struct Rife {
             trim();
         Slot& slot = *turn.slot;
         const auto starved = [&] { return slot.blobs.lost || slot.staging.lost; };
-        ncnn::Option opt = flownet.opt;
-        opt.blob_vkallocator = &slot.blobs;
-        opt.workspace_vkallocator = &slot.blobs;
-        opt.staging_vkallocator = &slot.staging;
-        const size_t element = opt.use_fp16_storage ? 2u : 4u;
+        ncnn::Option options = opt;
+        options.blob_vkallocator = &slot.blobs;
+        options.workspace_vkallocator = &slot.blobs;
+        options.staging_vkallocator = &slot.staging;
+        const size_t element = options.use_fp16_storage ? 2u : 4u;
         ncnn::VkCompute cmd(gpu);
 
         std::shared_ptr<Held> frames[2];
-        bool fresh[2] = {}, making[2] = {}, empty = false;
-        ncnn::VkMat mats[2], features[2];
+        bool fresh[2] = {}, empty = false;
+        ncnn::VkMat mats[2];
+        // the tensors of the net, which hold the frames too
+        std::vector<ncnn::VkMat> tensors;
         {
             const std::lock_guard<std::mutex> hold(cache);
             for (int index = 0; index < 2; index++) {
@@ -449,40 +435,29 @@ struct Rife {
                 } else {
                     frames[index] = std::make_shared<Held>();
                     frames[index]->id = pictures[index]->id;
-                    frames[index]->mat.create(wide, high, 3, element, 1, kept);
+                    frames[index]->mat.create(wide, high, graph.channels(), element, 1, kept);
                     empty |= frames[index]->mat.empty();
                     fresh[index] = true;
                 }
                 held.push_back(frames[index]);
                 mats[index] = frames[index]->mat;
-                if (frames[index]->feature[index].empty()) {
-                    ncnn::Option kind = opt;
-                    kind.blob_vkallocator = kept;
-                    try {
-                        frames[index]->feature[index] = graph.feature(index, wide, high, kind);
-                    } catch (const Lost&) {
-                    }
-                    making[index] = !frames[index]->feature[index].empty();
-                }
-                features[index] = frames[index]->feature[index];
             }
-            if (held.size() > 4)
+            while (held.size() > 4)
                 held.erase(held.begin());
         }
         // the allocator holds only these frames, so free them under the lock
         const auto finish = [&](bool done) {
             const std::lock_guard<std::mutex> hold(cache);
+            tensors.clear();
             for (int index = 0; index < 2; index++) {
-                if (fresh[index])
+                if (fresh[index]) {
                     frames[index]->ready = done;
-                if (making[index])
-                    frames[index]->featured[index] = done;
-                if ((fresh[index] || making[index]) && !done) {
-                    frames[index]->failed = true;
-                    held.erase(std::remove(held.begin(), held.end(), frames[index]), held.end());
+                    if (!done) {
+                        frames[index]->failed = true;
+                        held.erase(std::remove(held.begin(), held.end(), frames[index]), held.end());
+                    }
                 }
                 mats[index].release();
-                features[index].release();
                 frames[index].reset();
             }
             settled.notify_all();
@@ -497,27 +472,6 @@ struct Rife {
         std::vector<uint8_t> bytes[3];
         try {
             bytes[2] = take();
-            for (int index = 0; index < 2; index++) {
-                if (!fresh[index])
-                    continue;
-                bytes[index] = take();
-                pack(*pictures[index], bytes[index].data(), true);
-                ncnn::VkMat uploaded;
-                cmd.record_clone(ncnn::Mat(frame / 4, (void*)bytes[index].data(), (size_t)4u), uploaded, opt);
-                if (uploaded.empty())
-                    return fail(STARVED);
-                std::vector<ncnn::vk_constant_type> constants(15);
-                const int sizes[8] = { width, height, planes[1], planes[2], half, wide, high, (int)mats[index].cstep };
-                for (int i = 0; i < 8; i++)
-                    constants[i].i = sizes[i];
-                for (int i = 0; i < 7; i++)
-                    constants[8 + i].f = color[i];
-                ncnn::VkMat dispatcher;
-                dispatcher.w = wide;
-                dispatcher.h = high;
-                dispatcher.c = 1;
-                cmd.record_pipeline(in, { uploaded, mats[index] }, constants, dispatcher);
-            }
             // ready after its convert or make call, which the first submit waits for
             bool waited = false, gone = false;
             const auto settle = [&] {
@@ -528,8 +482,6 @@ struct Rife {
                         if (frame.failed)
                             return true;
                         if (!fresh[index] && !(index == 1 && frames[1] == frames[0]) && !frame.ready)
-                            return false;
-                        if (!features[index].empty() && !making[index] && !frame.featured[index])
                             return false;
                     }
                     return true;
@@ -548,11 +500,46 @@ struct Rife {
                 return failed;
             };
             const auto flush = [&] { return submit(true); };
+            int64_t work = 0;
             ncnn::VkMat result;
-            const bool filled[2] = { !making[0], !making[1] };
             try {
-                if (graph.run(mats, time, result, cmd, opt, features, filled, flush, SUBMIT_MACS))
+                for (int index = 0; index < 2; index++) {
+                    if (!fresh[index])
+                        continue;
+                    bytes[index] = take();
+                    pack(*pictures[index], bytes[index].data(), true);
+                    ncnn::VkMat uploaded;
+                    cmd.record_clone(ncnn::Mat(frame / 4, (void*)bytes[index].data(), (size_t)4u), uploaded, options);
+                    if (uploaded.empty())
+                        return fail(STARVED);
+                    std::vector<ncnn::vk_constant_type> constants(15);
+                    const int sizes[8] = { width, height, planes[1], planes[2], half, wide, high, (int)mats[index].cstep };
+                    for (int i = 0; i < 8; i++)
+                        constants[i].i = sizes[i];
+                    for (int i = 0; i < 7; i++)
+                        constants[8 + i].f = color[i];
+                    ncnn::VkMat dispatcher;
+                    dispatcher.w = wide;
+                    dispatcher.h = high;
+                    dispatcher.c = 1;
+                    cmd.record_pipeline(in, { uploaded, mats[index] }, constants, dispatcher);
+                    if (graph.frame.steps.empty())
+                        continue;
+                    // the net sees the picture alone, and writes the features after it
+                    tensors.assign(graph.frame.tensors, ncnn::VkMat());
+                    tensors[0] = mats[index];
+                    tensors[0].c = 3;
+                    tensors[graph.frame.output] = mats[index];
+                    if (graph.run(graph.frame, tensors, 0.f, cmd, options, flush, work, SUBMIT_MACS))
+                        return fail(starved() || gone ? STARVED : FAILED);
+                }
+                tensors.assign(graph.pair.tensors, ncnn::VkMat());
+                tensors[0] = mats[0];
+                tensors[1] = mats[1];
+                if (graph.run(graph.pair, tensors, time, cmd, options, flush, work, SUBMIT_MACS))
                     return fail(starved() || gone ? STARVED : FAILED);
+                result = tensors[graph.pair.output];
+                tensors.clear();
             } catch (const Lost&) {
                 return fail(STARVED);
             }
@@ -576,7 +563,7 @@ struct Rife {
                 cmd.record_pipeline(out, { result, packed }, constants, dispatcher);
             }
             ncnn::Mat downloaded(frame / 4, (void*)bytes[2].data(), (size_t)4u);
-            cmd.record_clone(packed, downloaded, opt);
+            cmd.record_clone(packed, downloaded, options);
             if (starved())
                 return fail(STARVED);
             const int failed = submit(false);
@@ -628,6 +615,8 @@ auto guard(F body, decltype(body()) error) -> decltype(body())
         return body();
     } catch (const std::bad_alloc&) {
         failure = "not enough memory";
+    } catch (const std::exception& e) {
+        failure = e.what();
     }
     return error;
 }
@@ -648,7 +637,8 @@ EXPORT void* rife_create(const char* models)
         Rife* rife = new Rife;
         if (!rife->load(models)) {
             delete rife;
-            failure = "rife could not load its model on the gpu";
+            if (failure.empty())
+                failure = "rife could not load its model on the gpu";
             return nullptr;
         }
         const std::lock_guard<std::mutex> hold(lock);
@@ -664,7 +654,7 @@ EXPORT void rife_shutdown()
     ncnn::destroy_gpu_instance();
 }
 
-// ncnn has nothing to build
+// the model is lowered for the size of the picture
 EXPORT int rife_prepare(void* rife, int width, int height, int bt601, int full, int yuv444, void (*)(void*, float), void*)
 {
     return guard([&] {

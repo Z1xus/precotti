@@ -1,13 +1,81 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 
+#include "glue.h"
 #include "network.h"
 
 namespace {
+
+struct Network : Backend {
+    INetworkDefinition& net;
+    std::vector<ITensor*> tensors;
+    std::deque<std::vector<uint16_t>> keep;
+    std::vector<std::unique_ptr<Glue>> plugins;
+    ITensor* time = nullptr;
+
+    explicit Network(INetworkDefinition& net)
+        : net(net)
+    {
+    }
+
+    template <class T>
+    T* check(T* object)
+    {
+        if (!object)
+            throw std::runtime_error("tensorrt could not change the model");
+        return object;
+    }
+
+    Weights half(const std::vector<float>& numbers)
+    {
+        keep.emplace_back(numbers.size());
+        for (size_t i = 0; i < numbers.size(); i++)
+            keep.back()[i] = float_to_half(numbers[i]);
+        return Weights { DataType::kHALF, keep.back().data(), (int64_t)numbers.size() };
+    }
+
+    Leaf wrap(ITensor* tensor, int c, int h, int w)
+    {
+        tensors.push_back(tensor);
+        return { (int)tensors.size() - 1, c, h, w };
+    }
+
+    Leaf convolution(const std::string& name, const Leaf& input, const std::vector<float>& weight, const std::vector<float>& bias, int outputs,
+        int stride, float slope, bool activated) override
+    {
+        IConvolutionLayer* conv = check(net.addConvolutionNd(*tensors[input.id], outputs, DimsHW(3, 3), half(weight), half(bias)));
+        conv->setPaddingNd(DimsHW(1, 1));
+        conv->setStrideNd(DimsHW(stride, stride));
+        conv->setName(name.c_str());
+        const int h = stride == 2 ? (input.h - 1) / 2 + 1 : input.h, w = stride == 2 ? (input.w - 1) / 2 + 1 : input.w;
+        if (!activated)
+            return wrap(conv->getOutput(0), outputs, h, w);
+        IActivationLayer* activation = check(net.addActivation(*conv->getOutput(0), ActivationType::kLEAKY_RELU));
+        activation->setAlpha(slope);
+        return wrap(activation->getOutput(0), outputs, h, w);
+    }
+
+    Leaf compose(const std::vector<Leaf>& inputs, const std::vector<Part>& parts, bool timed, int channels, int w, int h) override
+    {
+        std::vector<ITensor*> all;
+        for (const Leaf& input : inputs)
+            all.push_back(tensors[input.id]);
+        if (timed) {
+            if (!time)
+                throw std::runtime_error("the model reads the time in the frame step");
+            all.push_back(time);
+        }
+        plugins.push_back(std::make_unique<Glue>(glue_spec((int)inputs.size(), timed, channels, h, w, inputs[0].h, inputs[0].w, parts)));
+        IPluginV3Layer* layer = check(net.addPluginV3(all.data(), (int)all.size(), nullptr, 0, *plugins.back()));
+        layer->setName(("glue " + std::to_string(plugins.size())).c_str());
+        return wrap(layer->getOutput(0), channels, h, w);
+    }
+};
 
 struct Picture {
     uint8_t* data[3];
@@ -282,23 +350,26 @@ struct Rife {
         delete pair;
         delete frame;
         pair = frame = nullptr;
-        std::unique_ptr<Lowering> encoder, joiner;
+        std::unique_ptr<Network> encoder, joiner;
         const float split = plan.cached[0] >= 0 ? 0.1f : 0.f;
         if (plan.cached[0] >= 0) {
             frame = engine("frame", "rgb", editor([&](INetworkDefinition& net, IOptimizationProfile& profile) {
-                encoder = std::make_unique<Lowering>(net, model, plan);
-                output(net, encoder->frame(input(net, profile, "rgb", 3), high, wide), "feat");
+                encoder = std::make_unique<Network>(net);
+                const Leaf picture = encoder->wrap(input(net, profile, "rgb", 3), 3, high, wide);
+                const Leaf features = Lowering(*encoder, model, plan).frame(picture);
+                output(net, encoder->tensors[features.id], "feat");
             }),
                 0, split);
             if (!frame)
                 return false;
         }
         pair = engine("pair", "frame0", editor([&](INetworkDefinition& net, IOptimizationProfile& profile) {
-            joiner = std::make_unique<Lowering>(net, model, plan);
-            ITensor* first = input(net, profile, "frame0", channels);
-            ITensor* second = input(net, profile, "frame1", channels);
-            ITensor* moment = net.addInput("time", DataType::kFLOAT, Dims4(1, 1, 1, 1));
-            output(net, joiner->pair(first, second, moment, high, wide), "out0");
+            joiner = std::make_unique<Network>(net);
+            const Leaf first = joiner->wrap(input(net, profile, "frame0", channels), channels, high, wide);
+            const Leaf second = joiner->wrap(input(net, profile, "frame1", channels), channels, high, wide);
+            joiner->time = net.addInput("time", DataType::kFLOAT, Dims4(1, 1, 1, 1));
+            const Leaf result = Lowering(*joiner, model, plan).pair(first, second);
+            output(net, joiner->tensors[result.id], "out0");
         }),
             split, 1 - split);
         if (!pair)

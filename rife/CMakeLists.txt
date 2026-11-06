@@ -44,7 +44,7 @@ foreach(file flownet.param flownet.bin)
     endif()
 endforeach()
 
-foreach(name yuv_in yuv_out map interp warp shuffle)
+foreach(name yuv_in yuv_out compose)
     set(header ${CMAKE_CURRENT_BINARY_DIR}/${name}.comp.hex.h)
     add_custom_command(
         OUTPUT ${header}
@@ -54,7 +54,7 @@ foreach(name yuv_in yuv_out map interp warp shuffle)
     list(APPEND headers ${header})
 endforeach()
 
-add_library(interpolini_rife SHARED rife.cpp graph.cpp ${headers})
+add_library(interpolini_rife SHARED rife.cpp ${headers})
 target_include_directories(interpolini_rife PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${ncnn_SOURCE_DIR}/src/layer)
 target_link_libraries(interpolini_rife PRIVATE ncnn)
 

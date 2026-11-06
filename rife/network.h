@@ -1,22 +1,33 @@
 #pragma once
 
 #include <algorithm>
-#include <deque>
-#include <map>
 #include <memory>
 
-#include "glue.h"
 #include "kernels.h"
 #include "model.h"
-#include "tensorrt.h"
 
 namespace {
 
 enum { ADD, SUB, MUL, DIV, RSUB = 7 };
 
+// a tensor of a runtime, which names it by an id
 struct Leaf {
-    ITensor* tensor = nullptr;
+    int id = -1;
     int c = 0, h = 0, w = 0;
+
+    bool operator==(const Leaf& other) const
+    {
+        return id == other.id;
+    }
+};
+
+struct Backend {
+    virtual ~Backend() = default;
+    // a 3x3 convolution with a leaky activation when it is activated
+    virtual Leaf convolution(const std::string& name, const Leaf& input, const std::vector<float>& weight, const std::vector<float>& bias,
+        int outputs, int stride, float slope, bool activated) = 0;
+    // one step that writes the parts into a new tensor
+    virtual Leaf compose(const std::vector<Leaf>& inputs, const std::vector<Part>& parts, bool timed, int channels, int w, int h) = 0;
 };
 
 struct View {
@@ -159,45 +170,19 @@ Plan plan_of(const Model& model)
 }
 
 struct Lowering {
-    INetworkDefinition& net;
+    Backend& backend;
     const Model& model;
     const Plan& plan;
-    std::deque<std::vector<uint16_t>> keep;
-    std::vector<std::unique_ptr<Glue>> plugins;
     std::vector<Ref> values;
     std::vector<char> folded;
-    ITensor* time = nullptr;
-    std::map<ITensor*, std::pair<int, int>> sizes;
 
-    Lowering(INetworkDefinition& net, const Model& model, const Plan& plan)
-        : net(net)
+    Lowering(Backend& backend, const Model& model, const Plan& plan)
+        : backend(backend)
         , model(model)
         , plan(plan)
         , values(model.blobs)
         , folded(model.layers.size(), 0)
     {
-    }
-
-    template <class T>
-    T* check(T* object)
-    {
-        if (!object)
-            throw std::runtime_error("tensorrt could not change the model");
-        return object;
-    }
-
-    Weights half(const std::vector<float>& numbers)
-    {
-        keep.emplace_back(numbers.size());
-        for (size_t i = 0; i < numbers.size(); i++)
-            keep.back()[i] = float_to_half(numbers[i]);
-        return Weights { DataType::kHALF, keep.back().data(), (int64_t)numbers.size() };
-    }
-
-    Leaf leaf_of(ITensor* tensor)
-    {
-        const auto size = sizes.at(tensor);
-        return { tensor, (int)tensor->getDimensions().d[1], size.first, size.second };
     }
 
     static Ref view_of(const Leaf& leaf, int c0, int n, int shift = 0)
@@ -262,11 +247,11 @@ struct Lowering {
 
     Leaf memory(const Ref& value)
     {
-        if (value->stored.tensor)
+        if (value->stored.id >= 0)
             return value->stored;
         if (pure(value, true) && value->terms[0].view.c0 == 0 && value->terms[0].view.leaf.c == value->n)
             return value->terms[0].view.leaf;
-        value->stored = leaf_of(compose({ value }, value->w, value->h, value->n));
+        value->stored = compose({ value }, value->w, value->h, value->n);
         return value->stored;
     }
 
@@ -372,15 +357,15 @@ struct Lowering {
         return result;
     }
 
-    static Src bind(const View& view, std::vector<ITensor*>& inputs, int stages)
+    static Src bind(const View& view, std::vector<Leaf>& inputs, int stages)
     {
         Src src = { };
-        const auto at = std::find(inputs.begin(), inputs.end(), view.leaf.tensor);
+        const auto at = std::find(inputs.begin(), inputs.end(), view.leaf);
         src.input = (int)(at - inputs.begin());
         if (at == inputs.end()) {
             if (inputs.size() >= MAX_INPUTS)
-                throw std::runtime_error("the model needs more tensors in one step than the plugin takes");
-            inputs.push_back(view.leaf.tensor);
+                throw std::runtime_error("the model needs more tensors in one step than a step takes");
+            inputs.push_back(view.leaf);
         }
         src.c0 = view.c0;
         src.shuffle = 1 << view.shift;
@@ -400,7 +385,7 @@ struct Lowering {
         return src;
     }
 
-    static Src bind_image(const View& view, std::vector<ITensor*>& inputs, int w, int h, float k)
+    static Src bind_image(const View& view, std::vector<Leaf>& inputs, int w, int h, float k)
     {
         View sized = view;
         sized.w[1] = w;
@@ -410,7 +395,7 @@ struct Lowering {
         return src;
     }
 
-    static Part part_of(const Ref& value, int at, std::vector<ITensor*>& inputs, bool& timed, int w, int h)
+    static Part part_of(const Ref& value, int at, std::vector<Leaf>& inputs, bool& timed, int w, int h)
     {
         Part part = { };
         part.out_c = at;
@@ -449,9 +434,9 @@ struct Lowering {
         return part;
     }
 
-    ITensor* compose(const std::vector<Ref>& parts, int w, int h, int channels)
+    Leaf compose(const std::vector<Ref>& parts, int w, int h, int channels)
     {
-        std::vector<ITensor*> inputs;
+        std::vector<Leaf> inputs;
         std::vector<Part> list;
         bool timed = false;
         int at = 0;
@@ -461,46 +446,16 @@ struct Lowering {
         }
         if (at != channels || !w || !h || inputs.empty())
             throw std::runtime_error("the model has a value without a size");
-        std::vector<ITensor*> all = inputs;
-        if (timed) {
-            if (!time)
-                throw std::runtime_error("the model reads the time in the frame step");
-            all.push_back(time);
-        }
-        const auto reference = sizes.at(inputs[0]);
-        plugins.push_back(std::make_unique<Glue>(glue_spec((int)inputs.size(), timed, channels, h, w, reference.first, reference.second, list)));
-        IPluginV3Layer* layer = check(net.addPluginV3(all.data(), (int)all.size(), nullptr, 0, *plugins.back()));
-        layer->setName(("glue " + std::to_string(plugins.size())).c_str());
-        sizes[layer->getOutput(0)] = { h, w };
-        return layer->getOutput(0);
+        return backend.compose(inputs, list, timed, channels, w, h);
     }
 
-    ITensor* input_of(const Ref& value)
+    Leaf input_of(const Ref& value)
     {
         if (!value)
             throw std::runtime_error("the model uses a value that is not there");
         if (value->kind == Val::CONCAT)
             return compose(value->parts, value->w, value->h, value->n);
-        return memory(value).tensor;
-    }
-
-    ITensor* convolution(const Layer& layer, ITensor* input, const std::vector<float>& weight, const std::vector<float>& bias, int outputs,
-        int stride, float slope, bool activated)
-    {
-        IConvolutionLayer* conv = check(net.addConvolutionNd(*input, outputs, DimsHW(3, 3), half(weight), half(bias)));
-        conv->setPaddingNd(DimsHW(1, 1));
-        conv->setStrideNd(DimsHW(stride, stride));
-        conv->setName(layer.name.c_str());
-        auto size = sizes.at(input);
-        if (stride == 2)
-            size = { (size.first - 1) / 2 + 1, (size.second - 1) / 2 + 1 };
-        sizes[conv->getOutput(0)] = size;
-        if (!activated)
-            return conv->getOutput(0);
-        IActivationLayer* activation = check(net.addActivation(*conv->getOutput(0), ActivationType::kLEAKY_RELU));
-        activation->setAlpha(slope);
-        sizes[activation->getOutput(0)] = size;
-        return activation->getOutput(0);
+        return memory(value);
     }
 
     int root(int blob) const
@@ -523,8 +478,8 @@ struct Lowering {
         const bool square = layer.integer(1, 0) == 3 && layer.integer(11, 3) == 3 && layer.integer(2, 1) == 1 && layer.integer(12, 1) == 1
             && stride == layer.integer(13, stride) && layer.integer(4, 0) == 1 && layer.integer(14, 1) == 1 && layer.integer(15, 1) == 1
             && layer.integer(16, 1) == 1 && layer.integer(7, 1) == 1 && (stride == 1 || stride == 2);
-        ITensor* input = input_of(values[layer.bottoms[0]]);
-        const int inputs = (int)input->getDimensions().d[1];
+        const Leaf input = input_of(values[layer.bottoms[0]]);
+        const int inputs = input.c;
         const int activation = layer.integer(9, 0);
         if (!square || (activation != 0 && activation != 2) || (int)layer.weight.size() != outputs * inputs * 9)
             throw std::runtime_error("the model has a convolution that is not supported");
@@ -578,12 +533,10 @@ struct Lowering {
                     folded[index] = 1;
             }
             const Layer& relu = model.layers[fused[2]];
-            ITensor* result = convolution(layer, input, weight, shifted, outputs, 1, relu.number(0, 0), true);
-            values[relu.tops[0]] = view_of(leaf_of(result), 0, outputs);
+            values[relu.tops[0]] = view_of(backend.convolution(layer.name, input, weight, shifted, outputs, 1, relu.number(0, 0), true), 0, outputs);
             return;
         }
-        ITensor* result = convolution(layer, input, weight, bias, outputs, stride, slope, activation == 2);
-        values[layer.tops[0]] = view_of(leaf_of(result), 0, outputs);
+        values[layer.tops[0]] = view_of(backend.convolution(layer.name, input, weight, bias, outputs, stride, slope, activation == 2), 0, outputs);
     }
 
     void deconvolve(int index)
@@ -592,8 +545,8 @@ struct Lowering {
         if (!unfoldable(layer))
             throw std::runtime_error("the model has a deconvolution that is not supported");
         const int outputs = layer.integer(0, 0);
-        ITensor* input = input_of(values[layer.bottoms[0]]);
-        const int inputs = (int)input->getDimensions().d[1];
+        const Leaf input = input_of(values[layer.bottoms[0]]);
+        const int inputs = input.c;
         if ((int)layer.weight.size() != outputs * inputs * 16)
             throw std::runtime_error("the model has a deconvolution that is not supported");
         const int top = layer.tops[0];
@@ -625,8 +578,7 @@ struct Lowering {
                 }
             }
         }
-        ITensor* result = convolution(layer, input, weight, bias, outputs * 4, 1, 0, false);
-        const Leaf leaf = leaf_of(result);
+        const Leaf leaf = backend.convolution(layer.name, input, weight, bias, outputs * 4, 1, 0, false);
         const int channels = outputs * 4 >> (2 * shift);
         if (joined) {
             folded[reader] = 1;
@@ -829,33 +781,30 @@ struct Lowering {
         }
     }
 
-    ITensor* frame(ITensor* picture, int h, int w)
+    Leaf frame(const Leaf& picture)
     {
-        sizes[picture] = { h, w };
-        values[plan.inputs[0]] = view_of(leaf_of(picture), 0, 3);
+        values[plan.inputs[0]] = view_of(picture, 0, 3);
         walk(false);
         const Ref& features = values[plan.cached[0]];
         if (!features)
             throw std::runtime_error("the model has no frame features");
-        return memory(features).tensor;
+        return memory(features);
     }
 
-    ITensor* pair(ITensor* first, ITensor* second, ITensor* moment, int h, int w)
+    Leaf pair(const Leaf& first, const Leaf& second)
     {
-        time = moment;
-        sizes[first] = sizes[second] = { h, w };
-        ITensor* pictures[2] = { first, second };
+        const Leaf pictures[2] = { first, second };
         for (int role = 0; role < 2; role++) {
-            values[plan.inputs[role]] = view_of(leaf_of(pictures[role]), 0, 3);
+            values[plan.inputs[role]] = view_of(pictures[role], 0, 3);
             if (plan.cached[role] >= 0)
-                values[plan.cached[role]] = view_of(leaf_of(pictures[role]), 3, plan.features);
+                values[plan.cached[role]] = view_of(pictures[role], 3, plan.features);
         }
         values[plan.inputs[2]] = std::make_shared<Val>();
         values[plan.inputs[2]]->n = 1;
         values[plan.inputs[2]]->time = 1;
         walk(true);
         const Ref& out = plan.output < 0 ? nullptr : values[plan.output];
-        if (!out || out->n != 3 || out->w != w || out->h != h)
+        if (!out || out->n != 3 || out->w != first.w || out->h != first.h)
             throw std::runtime_error("the model has no output of three channels at the size of the picture");
         return input_of(out);
     }

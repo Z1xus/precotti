@@ -1,0 +1,453 @@
+// the steps between two convolutions in one pass: resize, move by a flow, blend, shuffle and the math of each pixel
+// the same math as compose in kernels.cu, on the tensors of ncnn
+
+#version 450
+
+#if NCNN_fp16_storage
+#extension GL_EXT_shader_16bit_storage: require
+#endif
+
+// the same layout as the parts of kernels.h
+struct Src
+{
+    int from;
+    int c0;
+    int shuffle;
+    int shift;
+    int stages;
+    int w[3];
+    int h[3];
+    float sx[2];
+    float sy[2];
+    float k;
+};
+
+struct Part
+{
+    int kind;
+    int out_c;
+    int n;
+    int terms;
+    int sigmoid;
+    Src s[5];
+    float bias;
+    float time;
+};
+
+layout (binding = 0) readonly buffer in0_blob { sfp in0[]; };
+layout (binding = 1) readonly buffer in1_blob { sfp in1[]; };
+layout (binding = 2) readonly buffer in2_blob { sfp in2[]; };
+layout (binding = 3) readonly buffer in3_blob { sfp in3[]; };
+layout (binding = 4) readonly buffer in4_blob { sfp in4[]; };
+layout (binding = 5) readonly buffer in5_blob { sfp in5[]; };
+layout (binding = 6) readonly buffer in6_blob { sfp in6[]; };
+layout (binding = 7) readonly buffer in7_blob { sfp in7[]; };
+layout (binding = 8) readonly buffer in8_blob { sfp in8[]; };
+layout (binding = 9) readonly buffer in9_blob { sfp in9[]; };
+layout (binding = 10) readonly buffer in10_blob { sfp in10[]; };
+layout (binding = 11) readonly buffer in11_blob { sfp in11[]; };
+// whole packs of four, one value goes through its component
+layout (binding = 12) writeonly buffer out_blob { sfpvec4 out_data[]; };
+layout (std430, binding = 13) readonly buffer part_blob { Part parts[]; };
+
+layout (push_constant) uniform parameter
+{
+    // the step of each input and of the output between two channels, doubled, plus one when a pack holds four channels
+    int m0;
+    int m1;
+    int m2;
+    int m3;
+    int m4;
+    int m5;
+    int m6;
+    int m7;
+    int m8;
+    int m9;
+    int m10;
+    int m11;
+    int om;
+    int outw;
+    int outh;
+    // the channel of the output where the first part starts
+    int base;
+    int count;
+    int channels;
+    float time;
+} p;
+
+// 1 for a step of one part that sums its sources, with the channels of the part
+layout (constant_id = 0) const int SIMPLE = 0;
+layout (constant_id = 1) const int NCH = 1;
+
+shared float tile[8][128];
+
+// a source is read from one of the inputs, the block runs with the buffer and the steps of its input
+#define INPUTS(BLOCK) \
+    switch (s.from) \
+    { \
+    case 0: BLOCK(in0, p.m0) break; \
+    case 1: BLOCK(in1, p.m1) break; \
+    case 2: BLOCK(in2, p.m2) break; \
+    case 3: BLOCK(in3, p.m3) break; \
+    case 4: BLOCK(in4, p.m4) break; \
+    case 5: BLOCK(in5, p.m5) break; \
+    case 6: BLOCK(in6, p.m6) break; \
+    case 7: BLOCK(in7, p.m7) break; \
+    case 8: BLOCK(in8, p.m8) break; \
+    case 9: BLOCK(in9, p.m9) break; \
+    case 10: BLOCK(in10, p.m10) break; \
+    default: BLOCK(in11, p.m11) break; \
+    }
+
+// where channel q of a pixel lies in a tensor, a pack holds four channels
+#define AT(M, q, pixel) (((M) & 1) != 0 ? ((((q) >> 2) * ((M) >> 1) + (pixel)) * 4 + ((q) & 3)) : ((q) * ((M) >> 1) + (pixel)))
+
+// rounds to fp16, the or with zero keeps the compiler from dropping the rounding
+float stored(float v)
+{
+#if NCNN_fp16_storage
+    return unpackHalf2x16(packHalf2x16(vec2(v, 0.0)) | uint(p.base >> 8)).x;
+#else
+    return v;
+#endif
+}
+
+struct Tap
+{
+    int a;
+    int b;
+    float f;
+};
+
+// the left sample and its weight, held inside the picture
+Tap pick(int x, float scale, int size)
+{
+    const float v = (float(x) + 0.5) * scale - 0.5;
+    int i = int(floor(v));
+    float f = v - float(i);
+    if (i < 0)
+    {
+        i = 0;
+        f = 0.0;
+    }
+    else if (i > size - 2)
+    {
+        i = max(size - 2, 0);
+        f = size > 1 ? 1.0 : 0.0;
+    }
+    return Tap(i, min(i + 1, size - 1), f);
+}
+
+#define GATHER(BUF, M) \
+    for (int i = 0; i < 8; i++) \
+    { \
+        if (i < count) \
+            acc[i] += weight * float(BUF[AT(M, q + i * sh * sh, pixel)]); \
+    }
+
+void gather(Src s, int x, int y, float weight, int lo, int count, inout float acc[8])
+{
+    const int sh = s.shuffle;
+    const int q = (s.c0 * sh + (y & (sh - 1))) * sh + (x & (sh - 1)) + lo * sh * sh;
+    const int pixel = (y >> s.shift) * (s.w[0] >> s.shift) + (x >> s.shift);
+    INPUTS(GATHER)
+}
+
+void add(Src s, int x, int y, int lo, int count, inout float acc[8])
+{
+    Tap ox = Tap(0, 0, 0.0), oy = Tap(0, 0, 0.0);
+    if (s.stages == 2)
+    {
+        ox = pick(x, s.sx[1], s.w[1]);
+        oy = pick(y, s.sy[1], s.h[1]);
+    }
+    for (int o = 0; o < (s.stages == 2 ? 4 : 1); o++)
+    {
+        const int fx = s.stages == 2 ? ((o & 1) != 0 ? ox.b : ox.a) : x;
+        const int fy = s.stages == 2 ? ((o & 2) != 0 ? oy.b : oy.a) : y;
+        const float outer = s.stages == 2 ? ((o & 1) != 0 ? ox.f : 1.0 - ox.f) * ((o & 2) != 0 ? oy.f : 1.0 - oy.f) : 1.0;
+        if (outer == 0.0)
+            continue;
+        Tap tx = Tap(0, 0, 0.0), ty = Tap(0, 0, 0.0);
+        if (s.stages > 0)
+        {
+            tx = pick(fx, s.sx[0], s.w[0]);
+            ty = pick(fy, s.sy[0], s.h[0]);
+        }
+        for (int j = 0; j < (s.stages > 0 ? 4 : 1); j++)
+        {
+            const float weight = s.stages > 0 ? ((j & 1) != 0 ? tx.f : 1.0 - tx.f) * ((j & 2) != 0 ? ty.f : 1.0 - ty.f) : 1.0;
+            if (weight != 0.0)
+                gather(s, s.stages > 0 ? ((j & 1) != 0 ? tx.b : tx.a) : fx, s.stages > 0 ? ((j & 2) != 0 ? ty.b : ty.a) : fy, s.k * outer * weight, lo, count, acc);
+        }
+    }
+}
+
+// the image of t, moved by the flow of f, resized to the output
+#define FLOW(BUF, M) \
+    flow = vec2(float(BUF[AT(M, fq, fpixel)]), float(BUF[AT(M, fq + fsh * fsh, fpixel)]));
+
+#define MOVE(BUF, M) \
+    for (int i = 0; i < 8; i++) \
+    { \
+        if (i < count) \
+        { \
+            const int d = i * sh * sh; \
+            const float sum = (float(BUF[AT(M, q[0] + d, pixel[0])]) * (1.0 - ax) + float(BUF[AT(M, q[1] + d, pixel[1])]) * ax) * (1.0 - ay) \
+                + (float(BUF[AT(M, q[2] + d, pixel[2])]) * (1.0 - ax) + float(BUF[AT(M, q[3] + d, pixel[3])]) * ax) * ay; \
+            acc[i] += t.k * resize * stored(sum); \
+        } \
+    }
+
+void warp(Src t, Src f, int x, int y, int lo, int count, inout float acc[8])
+{
+    const int w = t.w[0];
+    const int h = t.h[0];
+    const int sh = t.shuffle;
+    const int fsh = f.shuffle;
+    const Tap tx = pick(x, t.sx[0], w);
+    const Tap ty = pick(y, t.sy[0], h);
+    for (int j = 0; j < 4; j++)
+    {
+        const float resize = ((j & 1) != 0 ? tx.f : 1.0 - tx.f) * ((j & 2) != 0 ? ty.f : 1.0 - ty.f);
+        if (resize == 0.0)
+            continue;
+        const int px = (j & 1) != 0 ? tx.b : tx.a;
+        const int py = (j & 2) != 0 ? ty.b : ty.a;
+        const int fq = (f.c0 * fsh + (py & (fsh - 1))) * fsh + (px & (fsh - 1));
+        const int fpixel = (py >> f.shift) * (f.w[0] >> f.shift) + (px >> f.shift);
+        vec2 flow;
+        {
+            const Src s = f;
+            INPUTS(FLOW)
+        }
+        const float sx = float(px) + flow.x;
+        const float sy = float(py) + flow.y;
+        const int x0 = int(floor(sx));
+        const int y0 = int(floor(sy));
+        const int left = clamp(x0, 0, w - 1);
+        const int right = clamp(x0 + 1, 0, w - 1);
+        const int top = clamp(y0, 0, h - 1);
+        const int bottom = clamp(y0 + 1, 0, h - 1);
+        const float ax = sx - float(left);
+        const float ay = sy - float(top);
+        int q[4];
+        int pixel[4];
+        for (int k = 0; k < 4; k++)
+        {
+            const int cx = (k & 1) != 0 ? right : left;
+            const int cy = (k & 2) != 0 ? bottom : top;
+            q[k] = (t.c0 * sh + (cy & (sh - 1))) * sh + (cx & (sh - 1)) + lo * sh * sh;
+            pixel[k] = (cy >> t.shift) * (w >> t.shift) + (cx >> t.shift);
+        }
+        const Src s = t;
+        // nested like vulkan: a flow far outside the image gives weights far outside 0 to 1
+        INPUTS(MOVE)
+    }
+}
+
+// the four samples of a bilinear resize and their weights
+void samples(Src s, int stage, int x, int y, float k, out int px[4], out int py[4], out float weight[4])
+{
+    const Tap tx = pick(x, s.sx[stage], s.w[stage]);
+    const Tap ty = pick(y, s.sy[stage], s.h[stage]);
+    for (int j = 0; j < 4; j++)
+    {
+        px[j] = (j & 1) != 0 ? tx.b : tx.a;
+        py[j] = (j & 2) != 0 ? ty.b : ty.a;
+        weight[j] = k * ((j & 1) != 0 ? tx.f : 1.0 - tx.f) * ((j & 2) != 0 ? ty.f : 1.0 - ty.f);
+    }
+}
+
+// the samples are read before they are added, so the reads overlap
+#define SUM(BUF, M) \
+    for (int j = 0; j < 4; j++) \
+    { \
+        for (int i = 0; i < NCH; i++) \
+            v[j][i] = weight[j] != 0.0 ? float(BUF[AT(M, q[j] + i * sh * sh, pixel[j])]) : 0.0; \
+    }
+
+void sum_of(Src s, int px[4], int py[4], float weight[4], inout float acc[8])
+{
+    const int sh = s.shuffle;
+    int q[4];
+    int pixel[4];
+    for (int j = 0; j < 4; j++)
+    {
+        q[j] = (s.c0 * sh + (py[j] & (sh - 1))) * sh + (px[j] & (sh - 1));
+        pixel[j] = (py[j] >> s.shift) * (s.w[0] >> s.shift) + (px[j] >> s.shift);
+    }
+    float v[4][8];
+    for (int j = 0; j < 4; j++)
+    {
+        for (int i = NCH; i < 8; i++)
+            v[j][i] = 0.0;
+    }
+    INPUTS(SUM)
+    for (int i = 0; i < NCH; i++)
+        acc[i] += (v[0][i] * weight[0] + v[1][i] * weight[1]) + (v[2][i] * weight[2] + v[3][i] * weight[3]);
+}
+
+void add_all(Src s, int x, int y, inout float acc[8])
+{
+    int ox[4], oy[4];
+    float outer[4];
+    if (s.stages == 2)
+        samples(s, 1, x, y, s.k, ox, oy, outer);
+    for (int o = 0; o < (s.stages == 2 ? 4 : 1); o++)
+    {
+        int px[4], py[4];
+        float weight[4];
+        if (s.stages == 2)
+        {
+            if (outer[o] == 0.0)
+                continue;
+            samples(s, 0, ox[o], oy[o], outer[o], px, py, weight);
+        }
+        else if (s.stages == 1)
+        {
+            samples(s, 0, x, y, s.k, px, py, weight);
+        }
+        else
+        {
+            for (int j = 0; j < 4; j++)
+            {
+                px[j] = x;
+                py[j] = y;
+                weight[j] = j == 0 ? s.k : 0.0;
+            }
+        }
+        sum_of(s, px, py, weight, acc);
+    }
+}
+
+void main()
+{
+    const int x = int(gl_GlobalInvocationID.x);
+    const int y = int(gl_GlobalInvocationID.y);
+
+    if (x >= p.outw || y >= p.outh)
+        return;
+
+    const int slot = int(gl_LocalInvocationIndex);
+    const int pixel = y * p.outw + x;
+    const int stride = p.om >> 1;
+
+    if (SIMPLE != 0)
+    {
+        float acc[8];
+        for (int i = 0; i < 8; i++)
+            acc[i] = 0.0;
+        for (int t = 0; t < parts[0].terms; t++)
+            add_all(parts[0].s[t], x, y, acc);
+        const float constant = parts[0].bias + parts[0].time * p.time;
+        if ((p.om & 1) == 0)
+        {
+            for (int i = 0; i < NCH; i++)
+            {
+                const int e = (p.base + i) * stride + pixel;
+                out_data[e >> 2][e & 3] = sfp(parts[0].sigmoid != 0 ? 1.0 / (1.0 + exp(-(acc[i] + constant))) : acc[i] + constant);
+            }
+        }
+        else
+        {
+            for (int k = 0; k < 2; k++)
+            {
+                if (k * 4 < NCH)
+                    out_data[k * stride + pixel] = sfpvec4(acc[k * 4] + constant, acc[k * 4 + 1] + constant, acc[k * 4 + 2] + constant, acc[k * 4 + 3] + constant);
+            }
+        }
+        return;
+    }
+
+    for (int base = 0; base < p.channels; base += 8)
+    {
+        for (int i = 0; i < 8; i++)
+            tile[i][slot] = 0.0;
+        for (int n = 0; n < p.count; n++)
+        {
+            const int out_c = parts[n].out_c;
+            if (out_c >= base + 8 || out_c + parts[n].n <= base)
+                continue;
+            const int kind = parts[n].kind;
+            const int lo = max(out_c, base) - out_c;
+            const int count = min(out_c + parts[n].n, base + 8) - out_c - lo;
+            const int place = out_c + lo - base;
+            // the terms of a sum, the moved image of a warp, or the two moved images and the mask of a blend
+            float acc[8], other[8], mask[8];
+            for (int i = 0; i < 8; i++)
+            {
+                acc[i] = 0.0;
+                other[i] = 0.0;
+                mask[i] = 0.0;
+            }
+            for (int job = 0; job < (kind == 0 ? parts[n].terms : kind == 1 ? 1 : 3); job++)
+            {
+                float value[8];
+                for (int i = 0; i < 8; i++)
+                    value[i] = 0.0;
+                // a job is the sum of one source or the move of one image
+                if (kind == 0 || job == 2)
+                    add(parts[n].s[kind == 0 ? job : 4], x, y, job == 2 ? 0 : lo, job == 2 ? 1 : count, value);
+                else
+                    warp(parts[n].s[job * 2], parts[n].s[job * 2 + 1], x, y, lo, count, value);
+                for (int i = 0; i < 8; i++)
+                {
+                    if (kind == 2 && job == 1)
+                        other[i] = value[i];
+                    else if (kind == 2 && job == 2)
+                        mask[i] = value[i];
+                    else
+                        acc[i] += value[i];
+                }
+            }
+            if (kind == 0)
+            {
+                const float constant = parts[n].bias + parts[n].time * p.time;
+                for (int i = 0; i < 8; i++)
+                {
+                    if (i < count)
+                        tile[place + i][slot] = parts[n].sigmoid != 0 ? 1.0 / (1.0 + exp(-(acc[i] + constant))) : acc[i] + constant;
+                }
+            }
+            else if (kind == 1)
+            {
+                for (int i = 0; i < 8; i++)
+                {
+                    if (i < count)
+                        tile[place + i][slot] = acc[i];
+                }
+            }
+            else
+            {
+                // vulkan stores each step of the blend in fp16
+                const float m = mask[0];
+                const float rest = stored(1.0 - m);
+                for (int i = 0; i < 8; i++)
+                {
+                    if (i < count)
+                        tile[place + i][slot] = stored(stored(acc[i]) * m) + stored(stored(other[i]) * rest);
+                }
+            }
+        }
+        if ((p.om & 1) == 0)
+        {
+            for (int i = 0; i < 8; i++)
+            {
+                if (base + i < p.channels)
+                {
+                    const int e = (p.base + base + i) * stride + pixel;
+                    out_data[e >> 2][e & 3] = sfp(tile[i][slot]);
+                }
+            }
+        }
+        else
+        {
+            for (int k = 0; k < 2; k++)
+            {
+                if (base + k * 4 < p.channels)
+                    out_data[((base >> 2) + k) * stride + pixel] = sfpvec4(tile[k * 4][slot], tile[k * 4 + 1][slot], tile[k * 4 + 2][slot], tile[k * 4 + 3][slot]);
+            }
+        }
+    }
+}
