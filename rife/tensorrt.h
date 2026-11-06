@@ -25,7 +25,9 @@
 #endif
 
 #include "NvInfer.h"
-#include "NvOnnxParser.h"
+
+#include "kernels.h"
+#include "kernels.ptx.h"
 
 using namespace nvinfer1;
 
@@ -47,7 +49,10 @@ void fail(const char* message) noexcept
     }
 }
 
-void fail(const std::string& message) { fail(message.c_str()); }
+void fail(const std::string& message)
+{
+    fail(message.c_str());
+}
 
 void forget()
 {
@@ -75,7 +80,6 @@ struct Logger : ILogger {
 int32_t (*library_version)();
 void* (*create_builder)(void*, int32_t);
 void* (*create_runtime)(void*, int32_t);
-void* (*create_parser)(void*, void*, int);
 int (*cuda_malloc)(void**, size_t);
 int (*cuda_free)(void*);
 int (*cuda_mem_info)(size_t*, size_t*);
@@ -89,6 +93,22 @@ int (*cuda_event_create)(cudaEvent_t*, unsigned);
 int (*cuda_event_record)(cudaEvent_t, cudaStream_t);
 int (*cuda_event_wait)(cudaEvent_t);
 int (*cuda_event_destroy)(cudaEvent_t);
+int (*cuda_stream_wait_event)(cudaStream_t, cudaEvent_t, unsigned);
+int (*cuda_library_load)(void**, const void*, void*, void**, unsigned, void**, unsigned*, unsigned);
+int (*cuda_library_kernel)(void**, void*, const char*);
+IPluginRegistry* (*plugin_registry)();
+
+struct Dim3 {
+    unsigned x, y, z;
+};
+int (*cuda_launch)(const void*, Dim3, Dim3, void**, size_t, cudaStream_t);
+
+struct Kernels {
+    void* compose = nullptr;
+    void* simple = nullptr;
+    void* yuv_in = nullptr;
+    void* yuv_out = nullptr;
+} kernels;
 
 const int TO_DEVICE = 1, TO_HOST = 2;
 const unsigned NON_BLOCKING = 1, BLOCKING_SYNC = 1, DISABLE_TIMING = 2;
@@ -98,7 +118,6 @@ const unsigned NON_BLOCKING = 1, BLOCKING_SYNC = 1, DISABLE_TIMING = 2;
 #if _WIN32
 const char* const CUDA = "cudart64_12.dll";
 const char* const INFER = "nvinfer_" NAME(NV_TENSORRT_MAJOR) ".dll";
-const char* const ONNX = "nvonnxparser_" NAME(NV_TENSORRT_MAJOR) ".dll";
 // tensorrt loads its builder resource by name when it makes an engine, so it must be loaded already
 const char* const RESOURCE = "nvinfer_builder_resource_" NAME(NV_TENSORRT_MAJOR) ".dll";
 
@@ -109,7 +128,7 @@ std::filesystem::path here()
     wchar_t name[32768];
     const DWORD flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
     if (!GetModuleHandleExW(flags, (LPCWSTR)&here, &module) || !GetModuleFileNameW(module, name, 32768))
-        return {};
+        return { };
     return std::filesystem::path(name).parent_path();
 }
 
@@ -119,7 +138,7 @@ void* open(const std::filesystem::path& file, std::string& why)
     void* library = LoadLibraryExW(file.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!library) {
         const DWORD code = GetLastError();
-        char text[512] = {};
+        char text[512] = { };
         FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr, code, MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US), text,
             sizeof(text), nullptr);
         why = text;
@@ -136,13 +155,12 @@ void* symbol(void* library, const char* name)
 #else
 const char* const CUDA = "libcudart.so.12";
 const char* const INFER = "libnvinfer.so." NAME(NV_TENSORRT_MAJOR);
-const char* const ONNX = "libnvonnxparser.so." NAME(NV_TENSORRT_MAJOR);
 
 std::filesystem::path here()
 {
     Dl_info info;
     if (!dladdr((void*)&here, &info))
-        return {};
+        return { };
     return std::filesystem::path(info.dli_fname).parent_path();
 }
 
@@ -203,24 +221,32 @@ bool load_libraries()
     const std::filesystem::path folder = here() / "tensorrt";
     void* cuda = load(folder, CUDA);
     void* infer = cuda ? load(folder, INFER) : nullptr;
-    void* onnx = infer ? load(folder, ONNX) : nullptr;
 #if _WIN32
-    if (onnx && !load(folder, RESOURCE))
+    if (infer && !load(folder, RESOURCE))
         return false;
 #endif
-    if (!onnx || !bind(library_version, infer, "getInferLibVersion"))
+    if (!infer || !bind(library_version, infer, "getInferLibVersion"))
         return false;
     if (library_version() != NV_TENSORRT_VERSION) {
         fail(std::string(INFER) + " is version " + std::to_string(library_version()) + ", the plugin needs " + std::to_string(NV_TENSORRT_VERSION));
         return false;
     }
     loaded = bind(create_builder, infer, "createInferBuilder_INTERNAL") && bind(create_runtime, infer, "createInferRuntime_INTERNAL")
-        && bind(create_parser, onnx, "createNvOnnxParser_INTERNAL") && bind(cuda_malloc, cuda, "cudaMalloc") && bind(cuda_free, cuda, "cudaFree") && bind(cuda_mem_info, cuda, "cudaMemGetInfo")
-        && bind(cuda_malloc_host, cuda, "cudaMallocHost") && bind(cuda_free_host, cuda, "cudaFreeHost") && bind(cuda_memcpy, cuda, "cudaMemcpyAsync")
-        && bind(cuda_stream_create, cuda, "cudaStreamCreateWithFlags") && bind(cuda_stream_destroy, cuda, "cudaStreamDestroy")
-        && bind(cuda_stream_wait, cuda, "cudaStreamSynchronize")
+        && bind(plugin_registry, infer, "getPluginRegistry") && bind(cuda_malloc, cuda, "cudaMalloc") && bind(cuda_free, cuda, "cudaFree")
+        && bind(cuda_mem_info, cuda, "cudaMemGetInfo") && bind(cuda_malloc_host, cuda, "cudaMallocHost") && bind(cuda_free_host, cuda, "cudaFreeHost")
+        && bind(cuda_memcpy, cuda, "cudaMemcpyAsync") && bind(cuda_stream_create, cuda, "cudaStreamCreateWithFlags")
+        && bind(cuda_stream_destroy, cuda, "cudaStreamDestroy") && bind(cuda_stream_wait, cuda, "cudaStreamSynchronize")
         && bind(cuda_event_create, cuda, "cudaEventCreateWithFlags") && bind(cuda_event_record, cuda, "cudaEventRecord")
-        && bind(cuda_event_wait, cuda, "cudaEventSynchronize") && bind(cuda_event_destroy, cuda, "cudaEventDestroy");
+        && bind(cuda_event_wait, cuda, "cudaEventSynchronize") && bind(cuda_event_destroy, cuda, "cudaEventDestroy")
+        && bind(cuda_stream_wait_event, cuda, "cudaStreamWaitEvent") && bind(cuda_library_load, cuda, "cudaLibraryLoadData")
+        && bind(cuda_library_kernel, cuda, "cudaLibraryGetKernel") && bind(cuda_launch, cuda, "cudaLaunchKernel");
+    if (loaded) {
+        // the first call makes the context
+        void* library = nullptr;
+        loaded = cuda_ok(cuda_free(nullptr)) && cuda_ok(cuda_library_load(&library, kernels_ptx, nullptr, nullptr, 0, nullptr, nullptr, 0))
+            && cuda_ok(cuda_library_kernel(&kernels.compose, library, "compose")) && cuda_ok(cuda_library_kernel(&kernels.simple, library, "simple"))
+            && cuda_ok(cuda_library_kernel(&kernels.yuv_in, library, "yuv_in")) && cuda_ok(cuda_library_kernel(&kernels.yuv_out, library, "yuv_out"));
+    }
     return loaded;
 }
 
@@ -228,6 +254,7 @@ bool load_libraries()
 struct Monitor : IProgressMonitor {
     void (*report)(void*, float) = nullptr;
     void* user = nullptr;
+    float base = 0, span = 1;
     int steps = 0;
     float done = 0;
 
@@ -245,7 +272,7 @@ struct Monitor : IProgressMonitor {
     bool stepComplete(const char* name, int32_t step) noexcept override
     {
         if (report && timing(name) && steps > 0)
-            report(user, std::min(done + 0.5f * (step + 1) / steps, 1.f));
+            report(user, base + span * std::min(done + 0.5f * (step + 1) / steps, 1.f));
         return true;
     }
 
@@ -282,7 +309,7 @@ bool write(const std::filesystem::path& file, const void* data, size_t size)
     return true;
 }
 
-std::vector<char> build(const std::filesystem::path& onnx, const std::filesystem::path& name, const Edit& edit, Monitor& monitor)
+std::vector<char> build(const std::filesystem::path& name, const std::filesystem::path& learned, const Edit& edit, Monitor& monitor)
 {
     std::vector<char> plan;
     // the workspace defaults to all gpu memory, other programs hold some
@@ -293,53 +320,49 @@ std::vector<char> build(const std::filesystem::path& onnx, const std::filesystem
         fail("tensorrt could not start");
         return plan;
     }
-    INetworkDefinition* network = builder->createNetworkV2(0);
-    nvonnxparser::IParser* parser = network ? (nvonnxparser::IParser*)create_parser(network, &logger, NV_ONNX_PARSER_VERSION) : nullptr;
+    INetworkDefinition* network = builder->createNetworkV2(1U << (int)NetworkDefinitionCreationFlag::kSTRONGLY_TYPED);
     IBuilderConfig* config = builder->createBuilderConfig();
     IOptimizationProfile* profile = builder->createOptimizationProfile();
-    // the parser gets the bytes, it cannot open a path with letters outside of ascii on windows
-    const std::vector<char> model = read(onnx);
-    if (!network || !parser || !config || !profile) {
+    if (!network || !config || !profile) {
         fail("tensorrt could not set up the build");
-    } else if (parser->parse(model.data(), model.size()) && edit(*network, *profile)) {
+    } else if (edit(*network, *profile)) {
         config->addOptimizationProfile(profile);
         if (known)
             config->setMemoryPoolLimit(MemoryPoolType::kWORKSPACE, available);
-        config->setFlag(BuilderFlag::kFP16);
+        monitor.done = 0;
         config->setProgressMonitor(&monitor);
         // what the builder learned about the gpu in other builds makes this one shorter
-        const std::filesystem::path learned = onnx.parent_path().parent_path() / "timing.cache";
-        const std::vector<char> known = read(learned);
-        ITimingCache* cache = config->createTimingCache(known.data(), known.size());
+        const std::vector<char> remembered = read(learned);
+        ITimingCache* cache = config->createTimingCache(remembered.data(), remembered.size());
         // a cache that is torn or from another gpu is not used
-        if (!cache)
-            cache = config->createTimingCache(nullptr, 0);
-        if (!cache)
-            fail("tensorrt could not make a timing cache");
-        else {
-            config->setTimingCache(*cache, true);
-            if (IHostMemory* memory = builder->buildSerializedNetwork(*network, *config)) {
-                plan.assign((const char*)memory->data(), (const char*)memory->data() + memory->size());
-                delete memory;
-                // the app can build the same engine two times at once, so the file appears complete
-                write(name, plan.data(), plan.size());
-                if (IHostMemory* timing = cache->serialize()) {
-                    write(learned, timing->data(), timing->size());
-                    delete timing;
-                }
-            }
+        bool set = cache && config->setTimingCache(*cache, false);
+        if (!set) {
             delete cache;
+            cache = config->createTimingCache(nullptr, 0);
+            set = cache && config->setTimingCache(*cache, false);
         }
+        if (!set) {
+            fail("tensorrt could not make a timing cache");
+        } else if (IHostMemory* memory = builder->buildSerializedNetwork(*network, *config)) {
+            plan.assign((const char*)memory->data(), (const char*)memory->data() + memory->size());
+            delete memory;
+            // the app can build the same engine two times at once, so the file appears complete
+            write(name, plan.data(), plan.size());
+            if (IHostMemory* timing = cache->serialize()) {
+                write(learned, timing->data(), timing->size());
+                delete timing;
+            }
+        }
+        delete cache;
     }
     delete config;
-    delete parser;
     delete network;
     delete builder;
     return plan;
 }
 
 // the engine from its file, or built and kept in it
-ICudaEngine* load_engine(IRuntime* runtime, const std::filesystem::path& onnx, const std::filesystem::path& name, const Edit& edit,
+ICudaEngine* load_engine(IRuntime* runtime, const std::filesystem::path& name, const std::filesystem::path& learned, const Edit& edit,
     const std::function<bool(ICudaEngine&)>& fits, Monitor& monitor)
 {
     // two builds at once need twice the gpu memory, and one that waits can load the engine of the other
@@ -352,7 +375,7 @@ ICudaEngine* load_engine(IRuntime* runtime, const std::filesystem::path& onnx, c
         engine = nullptr;
     }
     if (!engine) {
-        plan = build(onnx, name, edit, monitor);
+        plan = build(name, learned, edit, monitor);
         if (!plan.empty())
             engine = runtime->deserializeCudaEngine(plan.data(), plan.size());
     }

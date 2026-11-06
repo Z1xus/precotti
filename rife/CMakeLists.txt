@@ -65,11 +65,22 @@ if(NOT APPLE)
         URL_HASH SHA256=bbeefc189a3387ac55fdce56545d9462f019c98406a0151c58f915349b3af249
         SOURCE_SUBDIR none)
     FetchContent_MakeAvailable(tensorrt)
-    file(DOWNLOAD
-        https://raw.githubusercontent.com/onnx/onnx-tensorrt/d5dce67db7c2e64b07e055571f5ec06f7f254de2/NvOnnxParser.h
-        ${CMAKE_CURRENT_BINARY_DIR}/NvOnnxParser.h
-        EXPECTED_HASH SHA256=2adb4493575008781e5e51a6ca9c8104b337e6f1ee196a94b01df27043a8fd9e)
-    add_library(interpolini_rife_trt SHARED trt.cpp)
+
+    find_program(CLANG NAMES clang clang-22 clang-21 clang-20 clang-19 clang-18 clang-17 clang-16 clang-15 clang-14
+        HINTS "C:/Program Files/LLVM/bin" REQUIRED)
+    set(ptx ${CMAKE_CURRENT_BINARY_DIR}/kernels.ptx)
+    add_custom_command(
+        OUTPUT ${ptx}
+        COMMAND ${CLANG} -x cuda --cuda-device-only --cuda-gpu-arch=sm_75 -nocudainc -nocudalib -Xclang -target-feature -Xclang +ptx70 -O3 -S
+            -o ${ptx} ${CMAKE_CURRENT_SOURCE_DIR}/kernels.cu
+        DEPENDS kernels.cu kernels.h
+        VERBATIM)
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/kernels.ptx.h
+        COMMAND ${CMAKE_COMMAND} -Dinput=${ptx} -Doutput=${CMAKE_CURRENT_BINARY_DIR}/kernels.ptx.h -P ${CMAKE_CURRENT_SOURCE_DIR}/ptx.cmake
+        DEPENDS ${ptx} ptx.cmake
+        VERBATIM)
+    add_library(interpolini_rife_trt SHARED trt.cpp ${CMAKE_CURRENT_BINARY_DIR}/kernels.ptx.h)
     target_include_directories(interpolini_rife_trt PRIVATE cuda ${tensorrt_SOURCE_DIR}/include ${CMAKE_CURRENT_BINARY_DIR})
     target_link_libraries(interpolini_rife_trt PRIVATE ${CMAKE_DL_LIBS})
 endif()

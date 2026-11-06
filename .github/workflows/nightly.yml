@@ -39,7 +39,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends cmake ninja-build
+          # clang 16 or newer, the ptx of clang 14 runs 10% slower
+          apt-get install -y --no-install-recommends cmake ninja-build clang-16
       - name: macOS tools
         if: runner.os == 'macOS'
         run: brew install ninja nasm pkgconf

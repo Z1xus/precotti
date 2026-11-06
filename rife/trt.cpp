@@ -1,11 +1,11 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
-#include <deque>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 
-#include "tensorrt.h"
+#include "network.h"
 
 namespace {
 
@@ -15,181 +15,41 @@ struct Picture {
     int id;
 };
 
-const char* const INPUTS[6] = { "first_y", "first_u", "first_v", "second_y", "second_u", "second_v" };
-const char* const OUTPUTS[3] = { "y", "u", "v" };
-enum { TIME, LUMA, LUMA_SCALE, CHROMA_SCALE, R_V, G_U, G_V, B_U, K_R, K_G, K_B, U_B, V_R, LUMA_RANGE, CHROMA_RANGE, VALUES };
+const int MAX_SIDE = 4096;
 
-struct Wrap {
-    INetworkDefinition* network = nullptr;
-    std::deque<float> floats;
-    // tensorrt reads each shape as one block until the build, and a deque keeps its elements where they are
-    std::deque<std::vector<int64_t>> shapes;
+enum { MAKING, READY, BROKEN };
 
-    // tensorrt gives no layer when it fails, and tells why to the logger first
-    template <class Layer> Layer* made(Layer* layer)
+struct Frame {
+    void* data = nullptr;
+    cudaEvent_t done = nullptr;
+    int id = 0;
+    int state = MAKING;
+
+    ~Frame()
     {
-        if (!layer)
-            throw std::runtime_error("tensorrt could not change the model");
-        return layer;
-    }
-
-    ITensor* constant(float value)
-    {
-        floats.push_back(value);
-        return made(network->addConstant(Dims4(1, 1, 1, 1), Weights { DataType::kFLOAT, &floats.back(), 1 }))->getOutput(0);
-    }
-
-    ITensor* shape(const std::vector<int64_t>& values)
-    {
-        shapes.push_back(values);
-        Dims dims;
-        dims.nbDims = 1;
-        dims.d[0] = (int64_t)values.size();
-        return made(network->addConstant(dims, Weights { DataType::kINT64, shapes.back().data(), (int64_t)values.size() }))->getOutput(0);
-    }
-
-    ITensor* math(ITensor* a, ITensor* b, ElementWiseOperation op)
-    {
-        return made(network->addElementWise(*a, *b, op))->getOutput(0);
-    }
-
-    ITensor* sum(ITensor* a, ITensor* b) { return math(a, b, ElementWiseOperation::kSUM); }
-    ITensor* product(ITensor* a, ITensor* b) { return math(a, b, ElementWiseOperation::kPROD); }
-
-    ITensor* clip(ITensor* tensor, float low, float high)
-    {
-        IActivationLayer* layer = made(network->addActivation(*tensor, ActivationType::kCLIP));
-        layer->setAlpha(low);
-        layer->setBeta(high);
-        return layer->getOutput(0);
-    }
-
-    ITensor* cut(ITensor* tensor, Dims4 start, ITensor* size, SampleMode mode = SampleMode::kSTRICT_BOUNDS)
-    {
-        ISliceLayer* layer = made(network->addSlice(*tensor, start, Dims4(1, 1, 1, 1), Dims4(1, 1, 1, 1)));
-        layer->setInput(2, *size);
-        layer->setMode(mode);
-        return layer->getOutput(0);
-    }
-
-    ITensor* value(ITensor* values, int index)
-    {
-        return made(network->addSlice(*values, Dims4(0, index, 0, 0), Dims4(1, 1, 1, 1), Dims4(1, 1, 1, 1)))->getOutput(0);
-    }
-
-    ITensor* bytes(ITensor* tensor, const char* name)
-    {
-        ITensor* rounded = clip(sum(tensor, constant(0.5f)), 0, 255);
-        ITensor* output = made(network->addCast(*rounded, DataType::kUINT8))->getOutput(0);
-        output->setName(name);
-        network->markOutput(*output);
-        return output;
-    }
-
-    // resizes to the size of another tensor, the color planes of 4:2:0 and 4:4:4 take the same engine
-    ITensor* resize(ITensor* tensor, ITensor* like)
-    {
-        IResizeLayer* layer = made(network->addResize(*tensor));
-        layer->setInput(1, *made(network->addShape(*like))->getOutput(0));
-        layer->setResizeMode(InterpolationMode::kLINEAR);
-        layer->setCoordinateTransformation(ResizeCoordinateTransformation::kHALF_PIXEL);
-        return layer->getOutput(0);
-    }
-
-    // half is 1 when the color planes are half the size of the picture, as in 4:2:0
-    bool operator()(INetworkDefinition& net, IOptimizationProfile& profile, int width, int height, int half, int side)
-    {
-        try {
-            edit(net, profile, width, height, half, side);
-            return true;
-        } catch (const std::runtime_error& error) {
-            fail(error.what());
-            return false;
-        }
-    }
-
-    void edit(INetworkDefinition& net, IOptimizationProfile& profile, int width, int height, int half, int side)
-    {
-        network = &net;
-        // removeTensor on an input fails in tensorrt 10.9, so the input is reused
-        ITensor* values = net.getInput(0);
-        std::vector<std::pair<ILayer*, int>> readers;
-        for (int index = 0; index < net.getNbLayers(); index++) {
-            ILayer* layer = net.getLayer(index);
-            for (int input = 0; input < layer->getNbInputs(); input++) {
-                if (layer->getInput(input) == values)
-                    readers.emplace_back(layer, input);
-            }
-        }
-        values->setName("settings");
-        values->setDimensions(Dims4(1, VALUES, 1, 1));
-        ITensor* result = net.getOutput(0);
-        auto at = [&](int index) { return value(values, index); };
-
-        ITensor* rgb[2];
-        ITensor* color = nullptr;
-        for (int frame = 0; frame < 2; frame++) {
-            ITensor* planes[3];
-            for (int plane = 0; plane < 3; plane++) {
-                const int shift = plane > 0 ? half : 0;
-                ITensor* input = made(net.addInput(INPUTS[frame * 3 + plane], DataType::kUINT8, Dims4(1, 1, -1, -1)));
-                profile.setDimensions(input->getName(), OptProfileSelector::kMIN, Dims4(1, 1, 1, 1));
-                profile.setDimensions(input->getName(), OptProfileSelector::kOPT, Dims4(1, 1, height >> shift, width >> shift));
-                profile.setDimensions(input->getName(), OptProfileSelector::kMAX, Dims4(1, 1, side, side));
-                planes[plane] = made(net.addCast(*input, DataType::kFLOAT))->getOutput(0);
-                if (plane > 0) {
-                    color = color ? color : input;
-                    planes[plane] = product(sum(resize(planes[plane], planes[0]), constant(-128)), at(CHROMA_SCALE));
-                }
-            }
-            ITensor* y = product(sum(planes[0], product(at(LUMA), constant(-1))), at(LUMA_SCALE));
-            ITensor* r = sum(y, product(at(R_V), planes[2]));
-            ITensor* g = math(math(y, product(at(G_U), planes[1]), ElementWiseOperation::kSUB), product(at(G_V), planes[2]), ElementWiseOperation::kSUB);
-            ITensor* b = sum(y, product(at(B_U), planes[1]));
-            ITensor* channels[3] = { clip(r, 0, 1), clip(g, 0, 1), clip(b, 0, 1) };
-            rgb[frame] = made(net.addConcatenation(channels, 3))->getOutput(0);
-        }
-
-        // the model takes sizes in steps of 64
-        ITensor* size = made(net.addShape(*rgb[0]))->getOutput(0);
-        ITensor* padded = product(math(sum(size, shape({ 0, 0, 63, 63 })), shape({ 1, 1, 64, 64 }), ElementWiseOperation::kFLOOR_DIV), shape({ 1, 1, 64, 64 }));
-        ITensor* plane = sum(product(padded, shape({ 1, 0, 1, 1 })), shape({ 0, 1, 0, 0 }));
-        ITensor* inputs[3] = { cut(rgb[0], Dims4(0, 0, 0, 0), padded, SampleMode::kCLAMP), cut(rgb[1], Dims4(0, 0, 0, 0), padded, SampleMode::kCLAMP),
-            cut(values, Dims4(0, TIME, 0, 0), plane, SampleMode::kCLAMP) };
-        ITensor* joined = made(net.addConcatenation(inputs, 3))->getOutput(0);
-        for (auto [layer, input] : readers)
-            layer->setInput(input, *joined);
-
-        net.unmarkOutput(*result);
-        ITensor* luma = sum(product(size, shape({ 1, 0, 1, 1 })), shape({ 0, 1, 0, 0 }));
-        ITensor* picture = clip(cut(result, Dims4(0, 0, 0, 0), size), 0, 1);
-        ITensor* r = cut(picture, Dims4(0, 0, 0, 0), luma);
-        ITensor* g = cut(picture, Dims4(0, 1, 0, 0), luma);
-        ITensor* b = cut(picture, Dims4(0, 2, 0, 0), luma);
-        ITensor* y = sum(sum(product(at(K_R), r), product(at(K_G), g)), product(at(K_B), b));
-        bytes(sum(product(y, at(LUMA_RANGE)), at(LUMA)), OUTPUTS[0]);
-        ITensor* chroma[2] = { product(math(b, y, ElementWiseOperation::kSUB), at(U_B)), product(math(r, y, ElementWiseOperation::kSUB), at(V_R)) };
-        // at half the size the bilinear samples at half pixels are the mean of each 2x2 block
-        for (int plane = 0; plane < 2; plane++)
-            bytes(sum(product(resize(chroma[plane], color), at(CHROMA_RANGE)), constant(128)), OUTPUTS[plane + 1]);
+        if (done)
+            cuda_event_destroy(done);
+        if (data)
+            cuda_free(data);
     }
 };
 
 struct Slot {
-    IExecutionContext* context = nullptr;
+    IExecutionContext* pair = nullptr;
+    IExecutionContext* frame = nullptr;
     void* memory = nullptr;
     cudaStream_t stream = nullptr;
     cudaEvent_t done = nullptr;
     uint8_t* device = nullptr;
     uint8_t* host = nullptr;
-    int held[2] = { -1, -1 };
 
     ~Slot()
     {
         // the gpu may still use the buffers of a frame that failed
         if (stream)
             cuda_stream_wait(stream);
-        delete context;
+        delete pair;
+        delete frame;
         if (memory)
             cuda_free(memory);
         if (done)
@@ -207,111 +67,258 @@ struct Rife {
     std::filesystem::path folder;
     Monitor monitor;
     IRuntime* runtime = nullptr;
-    ICudaEngine* engine = nullptr;
-    int width = 0, height = 0;
-    size_t planes[3] = {}, frame = 0;
+    ICudaEngine* pair = nullptr;
+    ICudaEngine* frame = nullptr;
+    bool loaded = false;
+    Model model;
+    Plan plan;
+    std::string engines;
+    int padding = 32;
+    int width = 0, height = 0, wide = 0, high = 0;
+    size_t planes[3] = { }, bytes = 0, tensor = 0;
+    int channels = 3;
     // 1 when the color planes are half the size of the picture
     int half = 1;
-    float values[VALUES] = {};
-    std::vector<Slot*> slots, idle;
+    float color[15] = { };
+    std::vector<std::unique_ptr<Slot>> slots;
+    std::vector<Slot*> idle;
     std::mutex lock;
     std::condition_variable ready;
+    std::mutex cache;
+    std::condition_variable settled;
+    std::vector<std::shared_ptr<Frame>> held;
+    std::mutex spare;
+    std::vector<std::unique_ptr<Frame>> pool;
 
     ~Rife()
     {
-        for (Slot* slot : slots)
-            delete slot;
-        delete engine;
+        slots.clear();
+        held.clear();
+        pool.clear();
+        delete pair;
+        delete frame;
         delete runtime;
     }
 
-    Slot* open()
+    std::shared_ptr<Frame> acquire(int id, bool& fresh)
     {
-        Slot* slot = new Slot;
-        slots.push_back(slot);
-        const size_t bytes = 3 * frame + sizeof(values);
-        if (!(slot->context = engine->createExecutionContext(ExecutionContextAllocationStrategy::kUSER_MANAGED)))
-            return nullptr;
-        for (int input = 0; input < 6; input++) {
-            const int shift = input % 3 > 0 ? half : 0;
-            if (!slot->context->setInputShape(INPUTS[input], Dims4(1, 1, height >> shift, width >> shift)))
+        const std::lock_guard<std::mutex> guard(cache);
+        const auto found = std::find_if(held.begin(), held.end(), [&](const auto& item) { return item->id == id; });
+        fresh = found == held.end();
+        if (!fresh) {
+            std::shared_ptr<Frame> frame = *found;
+            held.erase(found);
+            held.push_back(frame);
+            return frame;
+        }
+        // the oldest frame goes first, so a free one is used before a new one is made
+        if (held.size() >= 4)
+            held.erase(held.begin());
+        std::unique_ptr<Frame> made;
+        {
+            const std::lock_guard<std::mutex> inner(spare);
+            if (!pool.empty()) {
+                made = std::move(pool.back());
+                pool.pop_back();
+            }
+        }
+        if (!made) {
+            made = std::make_unique<Frame>();
+            if (!cuda_ok(cuda_malloc(&made->data, (size_t)channels * wide * high * 2)) || !cuda_ok(cuda_event_create(&made->done, DISABLE_TIMING)))
                 return nullptr;
         }
-        const size_t memory = slot->context->updateDeviceMemorySizeForShapes();
-        if (!cuda_ok(cuda_malloc(&slot->memory, memory)) || !cuda_ok(cuda_malloc((void**)&slot->device, bytes))
-            || !cuda_ok(cuda_malloc_host((void**)&slot->host, bytes)))
-            return nullptr;
-        slot->context->setDeviceMemoryV2(slot->memory, (int64_t)memory);
-        for (int plane = 0; plane < 3; plane++)
-            slot->context->setTensorAddress(OUTPUTS[plane], slot->device + 2 * frame + planes[plane]);
-        slot->context->setTensorAddress("settings", slot->device + 3 * frame);
-        if (!cuda_ok(cuda_stream_create(&slot->stream, NON_BLOCKING)) || !cuda_ok(cuda_event_create(&slot->done, BLOCKING_SYNC | DISABLE_TIMING)))
-            return nullptr;
-        return slot;
+        made->id = id;
+        made->state = MAKING;
+        std::shared_ptr<Frame> frame(made.release(), [this](Frame* item) {
+            const std::lock_guard<std::mutex> inner(spare);
+            pool.emplace_back(item);
+        });
+        held.push_back(frame);
+        return frame;
     }
 
-    // a rife that ran before keeps its engine, and its slots when the size is the same
+    void publish(const std::shared_ptr<Frame>& frame, int state)
+    {
+        {
+            const std::lock_guard<std::mutex> guard(cache);
+            frame->state = state;
+            if (state == BROKEN)
+                held.erase(std::remove(held.begin(), held.end(), frame), held.end());
+        }
+        settled.notify_all();
+    }
+
+    void drop()
+    {
+        const std::lock_guard<std::mutex> guard(cache);
+        held.clear();
+        const std::lock_guard<std::mutex> inner(spare);
+        pool.clear();
+    }
+
+    bool open(Slot& slot)
+    {
+        if (!(slot.pair = pair->createExecutionContext(ExecutionContextAllocationStrategy::kUSER_MANAGED)))
+            return false;
+        if (!slot.pair->setInputShape("frame0", Dims4(1, channels, high, wide))
+            || !slot.pair->setInputShape("frame1", Dims4(1, channels, high, wide)))
+            return false;
+        size_t memory = slot.pair->updateDeviceMemorySizeForShapes();
+        if (frame) {
+            if (!(slot.frame = frame->createExecutionContext(ExecutionContextAllocationStrategy::kUSER_MANAGED))
+                || !slot.frame->setInputShape("rgb", Dims4(1, 3, high, wide)))
+                return false;
+            memory = std::max<size_t>(memory, slot.frame->updateDeviceMemorySizeForShapes());
+        }
+        // tensorrt wants tensors on 256 bytes
+        const auto align = [](size_t size) { return (size + 255) / 256 * 256; };
+        const size_t device = align(bytes) + align(tensor) + 256;
+        const size_t host = 3 * align(bytes) + 256;
+        if (!cuda_ok(cuda_malloc(&slot.memory, memory)) || !cuda_ok(cuda_malloc((void**)&slot.device, device))
+            || !cuda_ok(cuda_malloc_host((void**)&slot.host, host)))
+            return false;
+        slot.pair->setDeviceMemoryV2(slot.memory, (int64_t)memory);
+        if (slot.frame)
+            slot.frame->setDeviceMemoryV2(slot.memory, (int64_t)memory);
+        return cuda_ok(cuda_stream_create(&slot.stream, NON_BLOCKING)) && cuda_ok(cuda_event_create(&slot.done, BLOCKING_SYNC | DISABLE_TIMING));
+    }
+
+    ICudaEngine* engine(const std::string& kind, const char* input, const Edit& edit, float base, float span)
+    {
+        const std::filesystem::path name = folder / (engines + kind + ".engine");
+        monitor.base = base;
+        monitor.span = span;
+        const auto fits = [&](ICudaEngine& found) {
+            const Dims low = found.getProfileShape(input, 0, OptProfileSelector::kMIN),
+                       top = found.getProfileShape(input, 0, OptProfileSelector::kMAX);
+            return low.d[2] <= high && low.d[3] <= wide && top.d[2] >= high && top.d[3] >= wide;
+        };
+        return load_engine(runtime, name, name.parent_path().parent_path() / "timing.cache", edit, fits, monitor);
+    }
+
+    template <class F>
+    Edit editor(F body)
+    {
+        return [body](INetworkDefinition& net, IOptimizationProfile& profile) {
+            try {
+                body(net, profile);
+                return true;
+            } catch (const std::runtime_error& error) {
+                fail(error.what());
+                return false;
+            }
+        };
+    }
+
+    ITensor* input(INetworkDefinition& net, IOptimizationProfile& profile, const char* name, int c)
+    {
+        ITensor* tensor = net.addInput(name, DataType::kHALF, Dims4(1, c, -1, -1));
+        if (!tensor)
+            throw std::runtime_error("tensorrt could not change the model");
+        // any size up to a square of this side, a larger video builds again
+        const int side = std::max({ MAX_SIDE, high, wide });
+        profile.setDimensions(name, OptProfileSelector::kMIN, Dims4(1, c, padding, padding));
+        profile.setDimensions(name, OptProfileSelector::kOPT, Dims4(1, c, high, wide));
+        profile.setDimensions(name, OptProfileSelector::kMAX, Dims4(1, c, side, side));
+        tensor->setAllowedFormats(1U << (int)TensorFormat::kLINEAR);
+        return tensor;
+    }
+
+    void output(INetworkDefinition& net, ITensor* tensor, const char* name)
+    {
+        tensor->setName(name);
+        net.markOutput(*tensor);
+        tensor->setAllowedFormats(1U << (int)TensorFormat::kLINEAR);
+    }
+
+    // a rife that ran before keeps its engines, and its slots when the size is the same
     bool prepare(int w, int h, bool bt601, bool full, bool yuv444)
     {
         forget();
         const float kr = bt601 ? 0.299f : 0.2126f, kb = bt601 ? 0.114f : 0.0722f, kg = 1 - kr - kb;
         const float luma = full ? 255 : 219, chroma = full ? 255 : 224;
         const float rv = 2 * (1 - kr), bu = 2 * (1 - kb);
-        const float numbers[VALUES] = { 0, full ? 0.f : 16.f, 1 / luma, 1 / chroma, rv, bu * kb / kg, rv * kr / kg, bu, kr, kg, kb, 1 / bu, 1 / rv, luma, chroma };
-        std::copy(numbers, numbers + VALUES, values);
-        if (!slots.empty() && w == width && h == height && half == !yuv444) {
-            // the frames in the slots are from the clip before
-            for (Slot* slot : slots)
-                slot->held[0] = slot->held[1] = -1;
+        const float numbers[15]
+            = { full ? 0.f : 16.f, 1 / luma, 1 / chroma, rv, bu * kb / kg, rv * kr / kg, bu, luma, chroma, kr, kg, kb, 1 / bu, 1 / rv, 0 };
+        std::copy(numbers, numbers + 15, color);
+        drop();
+        if (!slots.empty() && w == width && h == height && half == !yuv444)
             return true;
-        }
-        for (Slot* slot : slots)
-            delete slot;
         slots.clear();
         idle.clear();
         width = w;
         height = h;
         half = !yuv444;
-        // tensorrt wants tensors on 256 bytes
-        const auto align = [](size_t bytes) { return (bytes + 255) / 256 * 256; };
-        const size_t color = (size_t)(w >> half) * (h >> half);
-        planes[1] = align((size_t)w * h);
-        planes[2] = planes[1] + align(color);
-        frame = planes[2] + align(color);
+        // the newer models take the picture in larger steps of size
+        const std::string name = folder.u8string();
+        padding = name.find("rife-v4.25-lite") != std::string::npos                                        ? 128
+            : name.find("rife-v4.25") != std::string::npos || name.find("rife-v4.26") != std::string::npos ? 64
+                                                                                                           : 32;
+        wide = (w + padding - 1) / padding * padding;
+        high = (h + padding - 1) / padding * padding;
+        // ncnn copies a mat in blocks of 16 bytes
+        const auto word = [](size_t count) { return (count + 15) / 16 * 16; };
+        const size_t area = (size_t)(w >> half) * (h >> half);
+        planes[1] = word((size_t)w * h);
+        planes[2] = planes[1] + word(area);
+        bytes = planes[2] + word(area);
+        tensor = (size_t)3 * wide * high * 2;
 
+        if (!loaded) {
+            try {
+                model = read_model(folder);
+                engines = "graph3-" + std::to_string(model.hash) + "-";
+                plan = plan_of(model);
+            } catch (const std::exception& error) {
+                fail(error.what());
+                return false;
+            }
+            loaded = true;
+        }
+        channels = plan.cached[0] >= 0 ? 3 + plan.features : 3;
         if (!runtime && !(runtime = (IRuntime*)create_runtime(&logger, NV_TENSORRT_VERSION)))
             return false;
-        Wrap wrap;
-        // any size up to a square of this side, a larger video builds again; at 4096 the larger models ran out of gpu memory
-        const int side = (std::max({ w, h, 1920 }) + 63) / 64 * 64;
-        const Edit edit = [&](INetworkDefinition& network, IOptimizationProfile& profile) { return wrap(network, profile, w, h, half, side); };
-        const auto fits = [&](ICudaEngine& engine) {
-            if (engine.getTensorIOMode("settings") != TensorIOMode::kINPUT)
+        register_glue();
+        delete pair;
+        delete frame;
+        pair = frame = nullptr;
+        std::unique_ptr<Lowering> encoder, joiner;
+        const float split = plan.cached[0] >= 0 ? 0.1f : 0.f;
+        if (plan.cached[0] >= 0) {
+            frame = engine("frame", "rgb", editor([&](INetworkDefinition& net, IOptimizationProfile& profile) {
+                encoder = std::make_unique<Lowering>(net, model, plan);
+                output(net, encoder->frame(input(net, profile, "rgb", 3), high, wide), "feat");
+            }),
+                0, split);
+            if (!frame)
                 return false;
-            const Dims luma = engine.getProfileShape(INPUTS[0], 0, OptProfileSelector::kMAX);
-            const Dims color = engine.getProfileShape(INPUTS[1], 0, OptProfileSelector::kMAX);
-            return luma.d[2] >= h && luma.d[3] >= w && color.d[2] >= h && color.d[3] >= w;
-        };
-        if (!engine || !fits(*engine)) {
-            delete engine;
-            engine = nullptr;
-            engine = load_engine(runtime, folder / "rife.onnx", folder / "rife.engine", edit, fits, monitor);
         }
-        if (!engine)
+        pair = engine("pair", "frame0", editor([&](INetworkDefinition& net, IOptimizationProfile& profile) {
+            joiner = std::make_unique<Lowering>(net, model, plan);
+            ITensor* first = input(net, profile, "frame0", channels);
+            ITensor* second = input(net, profile, "frame1", channels);
+            ITensor* moment = net.addInput("time", DataType::kFLOAT, Dims4(1, 1, 1, 1));
+            output(net, joiner->pair(first, second, moment, high, wide), "out0");
+        }),
+            split, 1 - split);
+        if (!pair)
             return false;
-        // older plugins made one engine per size
         std::error_code error;
         for (const auto& file : std::filesystem::directory_iterator(folder, error)) {
-            if (file.path().extension() == ".engine" && file.path().filename() != "rife.engine")
+            if (file.path().extension() == ".engine" && file.path().filename().string().rfind(engines, 0) != 0)
                 std::filesystem::remove(file.path(), error);
         }
         // more slots gain little
         for (int count = 0; count < 2; count++) {
-            if (Slot* slot = open())
-                idle.push_back(slot);
-            else if (idle.empty()) {
-                fail("tensorrt could not set up the engine");
-                return false;
+            slots.push_back(std::make_unique<Slot>());
+            if (open(*slots.back()))
+                idle.push_back(slots.back().get());
+            else {
+                slots.pop_back();
+                if (idle.empty()) {
+                    fail("tensorrt could not set up the engine");
+                    return false;
+                }
             }
         }
         forget();
@@ -352,54 +359,110 @@ struct Rife {
         }
     }
 
-    bool run(Slot* slot, const Picture& first, const Picture& second, float time, const Picture& output)
+    Yuv yuv() const
     {
+        return { width, height, (int)planes[1], (int)planes[2], half, wide, high, wide * high, color[0], color[1], color[2], color[3], color[4],
+            color[5], color[6], color[7], color[8], color[9], color[10], color[11], color[12], color[13] };
+    }
+
+    bool make(Slot& slot, Frame& frame, const Picture& picture, uint8_t* host)
+    {
+        pack(picture, host, true);
+        Yuv args = yuv();
+        const uint8_t* source = slot.device;
+        void* in[] = { &source, &frame.data, &args };
+        const Dim3 block = { 16, 16, 1 }, grid = { (unsigned)(wide + 15) / 16, (unsigned)(high + 15) / 16, 1 };
+        if (cuda_memcpy(slot.device, host, bytes, TO_DEVICE, slot.stream) || cuda_launch(kernels.yuv_in, grid, block, in, 0, slot.stream))
+            return false;
+        if (slot.frame) {
+            if (!slot.frame->setTensorAddress("rgb", frame.data)
+                || !slot.frame->setTensorAddress("feat", (char*)frame.data + (size_t)3 * wide * high * 2) || !slot.frame->enqueueV3(slot.stream))
+                return false;
+        }
+        return !cuda_event_record(frame.done, slot.stream);
+    }
+
+    bool run(Slot& slot, const Picture& first, const Picture& second, float time, const Picture& output)
+    {
+        const auto align = [](size_t size) { return (size + 255) / 256 * 256; };
         const Picture* pictures[2] = { &first, &second };
-        int place[2] = { -1, -1 };
-        for (int picture = 0; picture < 2; picture++) {
-            for (int held = 0; held < 2; held++) {
-                if (slot->held[held] == pictures[picture]->id)
-                    place[picture] = held;
+        std::shared_ptr<Frame> frames[2];
+        bool fresh[2] = { };
+        struct Clean {
+            Slot& slot;
+            bool done = false;
+            ~Clean()
+            {
+                if (!done)
+                    cuda_stream_wait(slot.stream);
+            }
+        } clean { slot };
+        struct Open {
+            Rife& rife;
+            std::shared_ptr<Frame> frame;
+            ~Open()
+            {
+                if (frame)
+                    rife.publish(frame, BROKEN);
+            }
+        } open[2] { { *this }, { *this } };
+        for (int index = 0; index < 2; index++) {
+            if (!(frames[index] = acquire(pictures[index]->id, fresh[index])))
+                return false;
+            if (fresh[index])
+                open[index].frame = frames[index];
+        }
+        bool made = true;
+        for (int index = 0; index < 2; index++) {
+            if (fresh[index]) {
+                made = made && make(slot, *frames[index], *pictures[index], slot.host + index * align(bytes));
+                publish(frames[index], made ? READY : BROKEN);
+                open[index].frame = nullptr;
             }
         }
-        for (int picture = 0; picture < 2; picture++) {
-            if (place[picture] >= 0)
-                continue;
-            const int held = place[1 - picture] == 0;
-            pack(*pictures[picture], slot->host + held * frame, true);
-            if (cuda_memcpy(slot->device + held * frame, slot->host + held * frame, frame, TO_DEVICE, slot->stream))
-                return false;
-            slot->held[held] = pictures[picture]->id;
-            place[picture] = held;
-        }
-        for (int input = 0; input < 6; input++)
-            slot->context->setTensorAddress(INPUTS[input], slot->device + place[input / 3] * frame + planes[input % 3]);
-        float* settings = (float*)(slot->host + 3 * frame);
-        std::copy(values, values + VALUES, settings);
-        settings[TIME] = time;
-        uint8_t* result = slot->host + 2 * frame;
-        const bool done = !cuda_memcpy(slot->device + 3 * frame, settings, sizeof(values), TO_DEVICE, slot->stream)
-            && slot->context->enqueueV3(slot->stream)
-            && !cuda_memcpy(result, slot->device + 2 * frame, frame, TO_HOST, slot->stream)
-            && !cuda_event_record(slot->done, slot->stream)
-            && !cuda_event_wait(slot->done);
-        if (!done)
+        if (!made)
             return false;
-        pack(output, result, false);
+        for (int index = 0; index < 2; index++) {
+            if (fresh[index])
+                continue;
+            std::unique_lock<std::mutex> guard(cache);
+            settled.wait(guard, [&] { return frames[index]->state != MAKING; });
+            if (frames[index]->state == BROKEN || cuda_stream_wait_event(slot.stream, frames[index]->done, 0))
+                return false;
+        }
+        const size_t result = align(bytes), moment = result + align(tensor);
+        float* stored = (float*)(slot.host + 3 * align(bytes));
+        *stored = time;
+        if (cuda_memcpy(slot.device + moment, stored, sizeof(float), TO_DEVICE, slot.stream)
+            || !slot.pair->setTensorAddress("frame0", frames[0]->data) || !slot.pair->setTensorAddress("frame1", frames[1]->data)
+            || !slot.pair->setTensorAddress("time", slot.device + moment) || !slot.pair->setTensorAddress("out0", slot.device + result)
+            || !slot.pair->enqueueV3(slot.stream))
+            return false;
+        Yuv args = yuv();
+        const void* rgb = slot.device + result;
+        void* sink = slot.device;
+        void* out[] = { &rgb, &sink, &args };
+        const unsigned count = (unsigned)(width * height + (width >> half) * (height >> half));
+        uint8_t* host = slot.host + 2 * align(bytes);
+        if (cuda_launch(kernels.yuv_out, { (count + 255) / 256, 1, 1 }, { 256, 1, 1 }, out, 0, slot.stream)
+            || cuda_memcpy(host, slot.device, bytes, TO_HOST, slot.stream) || cuda_event_record(slot.done, slot.stream) || cuda_event_wait(slot.done))
+            return false;
+        clean.done = true;
+        pack(output, host, false);
         return true;
     }
 
     int process(const Picture& first, const Picture& second, float time, const Picture& output)
     {
-        Slot* slot = take();
-        const bool done = run(slot, first, second, time, output);
-        if (!done) {
-            // the copies and the inference before the failure still run, the next frame would write under them
-            cuda_stream_wait(slot->stream);
-            slot->held[0] = slot->held[1] = -1;
-        }
-        give(slot);
-        return done ? 0 : 1;
+        struct Lease {
+            Rife& rife;
+            Slot* slot;
+            ~Lease()
+            {
+                rife.give(slot);
+            }
+        } lease { *this, take() };
+        return run(*lease.slot, first, second, time, output) ? 0 : 1;
     }
 };
 
