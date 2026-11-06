@@ -6,8 +6,7 @@ target="${1:?target is required}"
 output="${2:-dist}"
 ffmpeg_version=8.1.3
 ffmpeg_source=7138d28c96d9d3e3af4ee3d8cad72741f8ffb40da90c1112235dea3ecd3178a3
-ffmpeg_release=autobuild-2026-10-20-13-08
-ffmpeg_build=ffmpeg-n$ffmpeg_version-18-g46d899d7a0
+ffmpeg_nightly=nightly-20261028-deadbad45175
 x264_commit=b35605ace3ddf7c1a5d67a2eb553f034aef41d55
 moltenvk_version=v1.4.2
 moltenvk_package=f95765a6229cb7b915990a2890ce12ebe36a730b021545d3d52ae69ce4c4024e
@@ -15,13 +14,11 @@ moltenvk_package=f95765a6229cb7b915990a2890ce12ebe36a730b021545d3d52ae69ce4c4024
 case "$target" in
   x86_64-unknown-linux-gnu)
     prefix=lib suffix=.so
-    archive="$ffmpeg_build-linux64-gpl-shared-8.1.tar.xz"
-    hash=1550d95f723911d1bd356dabfc1c1b6d26b1e7adaa36a5eda203f8e089d2bbd2
+    hash=4322c0316661be91945884d46170591ede91a760d48b9a41e8afca69844b0850
     ;;
   x86_64-pc-windows-msvc)
     prefix='' suffix=.dll
-    archive="$ffmpeg_build-win64-gpl-shared-8.1.zip"
-    hash=36a621ed90a46a2c68af52418be101e8e74327d2784bb35b6cf3874d59b00067
+    hash=36d797ab74ad0933f763f22e6045a300544070dc33516be0e72b7a8f0cbd4b21
     ;;
   aarch64-apple-darwin | x86_64-apple-darwin)
     prefix=lib suffix=.dylib
@@ -48,6 +45,7 @@ unpack() {
   fi
   case "$1" in
     *.zip) unzip -q "$work/download" -d "$work" ;;
+    *.tar.gz) tar -xzf - -C "$work" < "$work/download" ;;
     *) tar -xf "$work/download" -C "$work" ;;
   esac
   rm "$work/download"
@@ -69,10 +67,8 @@ if [[ "$target" != *-apple-darwin ]]; then
   cp "$work/rife/${prefix}interpolini_rife_trt$suffix" "$output/bin/"
   cp "$work/rife/_deps/tensorrt-src/LICENSE" "$output/licenses/tensorrt-headers.txt"
 
-  # btbn deletes its daily builds, so the one that is pinned stays here
-  unpack "https://github.com/BtbN/FFmpeg-Builds/releases/download/$ffmpeg_release/$archive" "$hash"
-  folder="${archive%.zip}"
-  mv "$work/${folder%.tar.xz}" "$output/ffmpeg"
+  unpack "https://github.com/Z1xus/precotti/releases/download/$ffmpeg_nightly/$target.tar.gz" "$hash"
+  mv "$work/ffmpeg" "$output/ffmpeg"
 else
   # apple killed vulkan so we bring our own
   unpack "https://github.com/KhronosGroup/MoltenVK/releases/download/$moltenvk_version/MoltenVK-macos.tar" "$moltenvk_package"
